@@ -107,3 +107,7 @@ class NuScenesOpenOccDataset(NuScenesDataset):
    
         res = self.occ_eval_metrics.count_miou()
         return res 
+    
+    def format_results(self, results, jsonfile_prefix=None, **kwargs):
+        print(f"Format the results... with {len(results)}")
+        print('\nFinished.')

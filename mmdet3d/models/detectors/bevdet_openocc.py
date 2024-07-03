@@ -6,6 +6,7 @@ Date: 2024-05-31 01:21:20
 Email: haimingzhang@link.cuhk.edu.cn
 Description: Adapt for the OpenOcc dataset.
 '''
+import os
 import torch
 from mmdet.models import DETECTORS
 from mmcv.cnn.bricks.conv_module import ConvModule
@@ -214,6 +215,7 @@ class BEVFusionStereo4DOpenOcc(BEVFusionStereo4DOCC):
                  balance_cls_weight=False,
                  loss_occ_weight=1.0,
                  pred_flow=False,
+                 save_root_dir=None,
                  **kwargs):
         super(BEVFusionStereo4DOpenOcc, self).__init__(**kwargs)
 
@@ -242,6 +244,8 @@ class BEVFusionStereo4DOpenOcc(BEVFusionStereo4DOCC):
                 nn.Linear(self.out_dim*2, 2),
             )
             self.flow_loss = builder.build_loss(dict(type='L1Loss', loss_weight=0.25))
+
+        self.save_root_dir = save_root_dir
         
     def loss_single(self, voxel_semantics, preds):
         loss_ = dict()
@@ -287,13 +291,23 @@ class BEVFusionStereo4DOpenOcc(BEVFusionStereo4DOCC):
 
         ## predict the flow
         if self.pred_flow:
-            flow_pred = self.flow_predicter(volume_feat)  # (bs, 200, 200, 16, 2)
-            flow_pred = flow_pred.cpu().numpy()
+            flow_pred_raw = self.flow_predicter(volume_feat)  # (bs, 200, 200, 16, 2)
+            flow_pred = flow_pred_raw.cpu().numpy()
 
         result_dict = dict()
         result_dict['occ_results'] = occ_res
         if self.pred_flow:
             result_dict['flow_results'] = flow_pred
+
+        if self.save_root_dir is not None:
+            os.makedirs(self.save_root_dir, exist_ok=True)
+            sample_token = img_metas[0]['sample_idx']
+            # save results
+            save_path = os.path.join(self.save_root_dir, f'{sample_token}.npz')
+            np.savez_compressed(save_path, 
+                                semantics=occ_res,
+                                flow=flow_pred_raw.half().cpu().numpy())
+        
         return [result_dict]
     
     def forward_train(self,

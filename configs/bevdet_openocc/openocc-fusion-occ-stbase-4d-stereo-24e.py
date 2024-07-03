@@ -50,6 +50,8 @@ multi_adj_frame_id_cfg = (1, 1+1, 1)
 
 model = dict(
     type='BEVFusionStereo4DOpenOcc',
+    save_root_dir="results/openocc_e4_wo_flow",
+    pred_flow=True,
     use_lovasz_loss=True,
     balance_cls_weight=True,
     loss_occ_weight=2,
@@ -249,9 +251,13 @@ share_data_config = dict(
     multi_adj_frame_id_cfg=multi_adj_frame_id_cfg,
 )
 
+# test_data_config = dict(
+#     pipeline=test_pipeline,
+#     ann_file=data_root + 'bevdetv2-nuscenes_infos_test_openocc.pkl')
+
 test_data_config = dict(
     pipeline=test_pipeline,
-    ann_file=data_root + 'bevdetv2-nuscenes_infos_val_openocc.pkl')
+    ann_file=data_root + 'bevdetv2-lidarseg-nuscenes_infos_test_openocc.pkl')
 
 data = dict(
     samples_per_gpu=2,
