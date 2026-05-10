@@ -7,7 +7,7 @@ from .bevdet_occ_nerf_S_v1 import MyBEVStereo4DOCCNeRFV1
 from .bevdet_occ_nerf_S_visualizer import MyBEVStereo4DOCCNeRFVisualizer
 from .bevdet_occ_pretrain import BEVStereo4DOCCPretrain, BEVStereo4DOCCTemporalNeRFPretrain, BEVStereo4DOCCTemporalNeRFPretrainV2, BEVStereo4DOCCTemporalNeRFPretrainV3
 from .bevdet_occ_ssc import BEVFusionStereo4DSSCOCC
-from .bevdet_occ_gs import BEVStereo4DOCCGS
+from .bevdet_occ_gs import BEVStereo4DOCCGS, BEVStereo4DOCCVisionPAD
 from .bevdet_fusion_occ import BEVFusionStereo4DOCCNeRF
 from .bevdet_occ_openscene import BEVFusionStereo4DOCCOpenScene, BEVDepth4DOCCOpenScene
 from .bevdet_openocc import BEVStereo4DOpenOcc, BEVFusionStereo4DOpenOcc
@@ -55,5 +55,5 @@ __all__ = [
     'BEVStereo4DOCCSegmentorDense', 'MyBEVStereo4DOCCNeRFVisualizer',
     'BEVFusionOCCLidarSupervise', 'BEVFusionOCCLidarSegSupervise', 'BEVDetRenderOcc',
     'BEVStereo4DOCCRoboDrive', 'BEVFusionStereo4DOCCOpenScene', 'BEVDepth4DOCCOpenScene',
-    'BEVStereo4DOpenOcc', 'BEVFusionStereo4DOpenOcc'
+    'BEVStereo4DOpenOcc', 'BEVFusionStereo4DOpenOcc', 'BEVStereo4DOCCVisionPAD'
 ]

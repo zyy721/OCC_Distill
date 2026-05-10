@@ -122,3 +122,13 @@ class NuScenesDatasetOccpancy(NuScenesDataset):
             save_path = os.path.join(submission_prefix, '{}.npz'.format(sample_token))
             np.savez_compressed(save_path, occ_pred.astype(np.uint8))
         print('\nFinished.')
+
+
+@DATASETS.register_module()
+class NuScenesDatasetOccpancyOverFit(NuScenesDatasetOccpancy):
+    def __getitem__(self, idx):
+        idx = 100
+        return super().__getitem__(idx)
+    
+    def __len__(self):
+        return 5000

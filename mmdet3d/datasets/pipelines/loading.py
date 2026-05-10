@@ -1196,6 +1196,24 @@ def mmlabNormalize(img):
     return img
 
 
+def mmlab_wo_normalize(img):
+    """Normalize the image to [0, 1] without mean and std.
+
+    Args:
+        img (PIL.Image): (h, w, 3)
+
+    Returns:
+        _type_: _description_
+    """
+    from mmcv.image.photometric import imnormalize
+    mean = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    std = np.array([255.0, 255.0, 255.0], dtype=np.float32)
+    to_rgb = True
+    img = imnormalize(np.array(img), mean, std, to_rgb)
+    img = torch.tensor(img).float().permute(2, 0, 1).contiguous()  # to (C, H, W)
+    return img
+
+
 @PIPELINES.register_module()
 class PrepareImageInputs(object):
     """Load multi channel images from a list of separate channel files.
@@ -1726,8 +1744,9 @@ class PrepareImageInputsForNeRF(object):
     def img_transform(self, img, post_rot, post_tran, resize, resize_dims,
                       crop, flip, rotate, resample=None):
         # adjust image
-        img = self.img_transform_core(
-            img, resize_dims, crop, flip, rotate, resample=resample)
+        if img is not None:
+            img = self.img_transform_core(
+                img, resize_dims, crop, flip, rotate, resample=resample)
 
         # post-homography transformation
         post_rot *= resize
@@ -1799,8 +1818,11 @@ class PrepareImageInputsForNeRF(object):
             rotate = 0
         return resize, resize_dims, crop, flip, rotate
 
-    def sample_noaugmentation(self, H, W):
-        fH, fW = self.data_config['input_size']
+    def sample_noaugmentation(self, H, W, input_size=None):
+        if input_size is None:
+            input_size = self.data_config['input_size']
+            
+        fH, fW = input_size
         resize = float(fW) / float(W)
         resize_dims = (int(W * resize), int(H * resize))
         newW, newH = resize_dims
@@ -1848,26 +1870,31 @@ class PrepareImageInputsForNeRF(object):
         post_rots_ori = []
         post_trans_ori = []
         img_files = []
+        target_imgs = []
+        target_imgs_post_rots = []
+        target_imgs_trans = []
         for cam_name in cam_names:
             cam_data = results['curr']['cams'][cam_name]
             filename = cam_data['data_path']
-            img = Image.open(filename)
+            img_ori = Image.open(filename)
             img_files.append(filename)
             post_rot = torch.eye(2)
             post_tran = torch.zeros(2)
 
-            render_img_gt = self.img_transform_core(img, self.data_config.render_size[::-1], None, False, None)
+            # only resize the original image
+            render_img_gt = self.img_transform_core(
+                img_ori, self.data_config.render_size[::-1], None, False, None)
             intrin = torch.Tensor(cam_data['cam_intrinsic'])
 
             sensor2ego, ego2global = \
                 self.get_sensor_transforms(results['curr'], cam_name)
             # image view augmentation (resize, crop, horizontal flip, rotate)
             img_augs = self.sample_augmentation(
-                H=img.height, W=img.width, flip=flip, scale=scale)
+                H=img_ori.height, W=img_ori.width, flip=flip, scale=scale)
             resize, resize_dims, crop, flip, rotate = img_augs
-            img_non_aug = self.sample_noaugmentation(H=img.height, W=img.width)
+            img_non_aug = self.sample_noaugmentation(H=img_ori.height, W=img_ori.width)
             img, post_rot2, post_tran2 = \
-                self.img_transform(img, post_rot,
+                self.img_transform(img_ori, post_rot,
                                    post_tran,
                                    resize=resize,
                                    resize_dims=resize_dims,
@@ -1877,14 +1904,22 @@ class PrepareImageInputsForNeRF(object):
 
             post_rot = torch.eye(2)
             post_tran = torch.zeros(2)  # 0.44 (704, 396) (0, 12, 704, 396) False 0.0
-            _, post_rot2_wo_aug, post_tran2_wo_aug = \
-                self.img_transform(img, post_rot,
+            img_wo_aug, post_rot2_wo_aug, post_tran2_wo_aug = \
+                self.img_transform(img_ori, post_rot,
                                    post_tran,
                                    resize=img_non_aug[0],
                                    resize_dims=img_non_aug[1],
                                    crop=img_non_aug[2],
                                    flip=img_non_aug[3],
                                    rotate=img_non_aug[4])
+
+            target_imgs.append(mmlab_wo_normalize(img_wo_aug))
+            target_post_rot = torch.eye(3)
+            targt_post_tran = torch.zeros(3)
+            target_post_rot[:2, :2] = post_rot2_wo_aug
+            targt_post_tran[:2] = post_tran2_wo_aug
+            target_imgs_post_rots.append(target_post_rot)
+            target_imgs_trans.append(targt_post_tran)
             
             # for convenience, make augmentation matrices 3x3
             post_tran = torch.zeros(3)
@@ -1943,6 +1978,7 @@ class PrepareImageInputsForNeRF(object):
 
         imgs = torch.stack(imgs)
         render_img_gts = torch.stack(render_img_gts)
+        target_imgs = torch.stack(target_imgs)
         sensor2egos = torch.stack(sensor2egos)
         ego2globals = torch.stack(ego2globals)
         intrins = torch.stack(intrins)
@@ -1953,11 +1989,15 @@ class PrepareImageInputsForNeRF(object):
         results['canvas'] = canvas
         results['img_files'] = img_files
         return (imgs, sensor2egos, ego2globals, intrins, post_rots, post_trans), \
-                render_img_gts, post_rots_ori, post_trans_ori
+                render_img_gts, post_rots_ori, post_trans_ori, \
+                target_imgs, target_imgs_post_rots, target_imgs_trans
 
     def __call__(self, results):
         results['img_inputs'], results['render_gt_img'], \
-            results['post_rots_ori'], results['post_trans_ori'] = self.get_inputs(results)
+            results['post_rots_ori'], results['post_trans_ori'], \
+                results['target_imgs'], \
+                    results['target_imgs_post_rots'], \
+                        results['target_imgs_post_trans'] = self.get_inputs(results)
         return results
 
 

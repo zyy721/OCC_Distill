@@ -40,7 +40,8 @@ NUSCENSE_LIDARSEG_PALETTE = torch.Tensor([
     (75, 0, 75),
     (112, 180, 60),
     (222, 184, 135),  # Burlywood
-    (0, 175, 0)
+    (0, 175, 0),
+    (0, 0, 0)
 ])
 
 
@@ -426,26 +427,27 @@ class MyBEVStereo4DOCCNeRF(BEVStereo4D):
         """Test function without augmentaiton."""
         img_feats, _, _ = self.extract_feat(
             points, img=img, img_metas=img_metas, **kwargs)
-        occ_pred_ori = self.final_conv(img_feats[0]).permute(0, 4, 3, 2, 1)
+        volume_feat = self.final_conv(img_feats[0]).permute(0, 4, 3, 2, 1)
 
         if self.use_predicter:
             # to (b, 200, 200, 16, c)
-            occ_pred_ori = self.predicter(occ_pred_ori)
+            volume_feat = self.predicter(volume_feat)
         
-        occ_pred = occ_pred_ori[..., :-3] \
-            if self.NeRFDecoder.img_recon_head else occ_pred_ori
+        _occ_pred = volume_feat[..., :self.num_classes]
 
-        occ_score = occ_pred.softmax(-1)
+        occ_score = _occ_pred.softmax(-1)
         occ_res = occ_score.argmax(-1)
         occ_res = occ_res.squeeze(dim=0).cpu().numpy().astype(np.uint8)
 
         ## nerf
         VISUALIZE = True
         if VISUALIZE:
+            from mmdet3d.models.utils.vis_utils import VisElement, visualize_elements
+
             # to (b, c, 200, 200, 16)
             use_gt_occ = False
 
-            occ_pred = occ_pred_ori.permute(0, 4, 1, 2, 3)
+            occ_pred = volume_feat.permute(0, 4, 1, 2, 3)
 
             # semantic
             if self.NeRFDecoder.semantic_head:
@@ -453,44 +455,83 @@ class MyBEVStereo4DOCCNeRF(BEVStereo4D):
                 semantic = occ_pred[:, :self.NeRFDecoder.semantic_dim, ...]
             else:
                 semantic = torch.zeros_like(occ_pred[:, :self.NeRFDecoder.semantic_dim, ...])
+            
             # density
-            if use_gt_occ:
+            if use_gt_occ: # render the occupancy GT directly for debugg
                 # (b, 200, 200, 16)
-                density_prob = kwargs['voxel_semantics'][0].unsqueeze(1)
-                density_prob = density_prob != 17
+                voxel_semantics = kwargs['voxel_semantics'][0]
+
+                density_prob = voxel_semantics != 17
                 density_prob = density_prob.float()
                 density_prob[density_prob == 0] = -10  # scaling to avoid 0 in alphas
                 density_prob[density_prob == 1] = 10
+                density_prob = density_prob.unsqueeze(1)  # (b, 1, 200, 200, 16)
+
+                # use the gt semantic
+                semantic = NUSCENSE_LIDARSEG_PALETTE[voxel_semantics.long()].to(occ_pred)
+                semantic = semantic.permute(0, 4, 1, 2, 3)
             else:
                 density_prob = -occ_pred[:, self.NeRFDecoder.semantic_dim: self.NeRFDecoder.semantic_dim+1]
+
+                 ## firstly we need to find the semantic class for each voxel
+                semantic = semantic.argmax(1)
+                # mapping the color
+                semantic = NUSCENSE_LIDARSEG_PALETTE[semantic].to(occ_pred)  # to (6, h, w, 3)
+                semantic = semantic.permute(0, 4, 1, 2, 3)
 
             intricics = kwargs['intricics']
             pose_spatial = kwargs['pose_spatial']
             rgb_recons = occ_pred[:, -3:]
 
-            ## firstly we need to find the semantic class for each voxel
-            semantic = semantic.argmax(1)
-            # mapping the color
-            semantic = NUSCENSE_LIDARSEG_PALETTE[semantic].to(occ_pred)  # to (6, h, w, 3)
-            semantic = semantic.permute(0, 4, 1, 2, 3)
-
+            self.NeRFDecoder.mask_render = False
             render_depth, rgb_pred, semantic_pred = self.NeRFDecoder(
                 density_prob, rgb_recons, semantic, 
                 intricics[0], pose_spatial[0], 
                 is_train=False, render_mask=None)
             
-            render_img_gt = kwargs['render_gt_img'][0]
-            current_frame_img = render_img_gt.view(
-                6, self.num_frame, -1, 
-                render_img_gt.shape[-2], 
-                render_img_gt.shape[-1])[:, 0].cpu().numpy()
-            # sem = semantic_pred[0].argmax(1)  # to (6, H, W)
-            # sem_color = NUSCENSE_LIDARSEG_PALETTE[sem]  # to (6, h, w, 3)
-            self.NeRFDecoder.visualize_image_semantic_depth_pair(
-                current_frame_img,
-                semantic_pred[0].permute(0, 2, 3, 1),
-                render_depth[0],
-                save=True
+            # render_img_gt = kwargs['render_gt_img'][0]
+            # current_frame_img = render_img_gt.view(
+            #     6, self.num_frame, -1, 
+            #     render_img_gt.shape[-2], 
+            #     render_img_gt.shape[-1])[:, 0].cpu().numpy()
+            
+            target_imgs = kwargs['target_imgs'][0]
+            # self.NeRFDecoder.visualize_image_semantic_depth_pair(
+            #     current_frame_img,
+            #     semantic_pred[0].permute(0, 2, 3, 1),
+            #     render_depth[0],
+            #     save=True
+            # )
+
+            target_size = (target_imgs.shape[-2], target_imgs.shape[-1])  # (H, W)
+            save_dir = "./results/ICCV"
+            visualize_elements(
+                [
+                    VisElement(
+                        target_imgs[0],
+                        need_denormalize=False,
+                        type='rgb'
+                    ),
+                    VisElement(
+                        render_depth[0],
+                        type='depth',
+                        is_sparse=False
+                    ),
+                    VisElement(
+                        rgb_pred[0],
+                        type='rgb',
+                        need_denormalize=False,
+                        is_sparse=False
+                    ),
+                    VisElement(
+                        semantic_pred[0],
+                        type='semantic',
+                        is_sparse=False
+                    ),
+                ],
+                target_size=target_size,
+                save_dir=save_dir,
+                cam_order=list(range(6))
             )
         return [occ_res]
 
@@ -529,25 +570,27 @@ class MyBEVStereo4DOCCNeRF(BEVStereo4D):
         losses = dict()
         loss_depth = self.img_view_transformer.get_depth_loss(gt_depth, depth)
         losses['loss_depth'] = loss_depth
-        render_img_gt = kwargs['render_gt_img']
+
+        # render_img_gt = kwargs['render_gt_img']
+        render_img_gt = kwargs['target_imgs']
         render_gt_depth = kwargs['render_gt_depth']
 
         # occupancy prediction
-        occ_pred = self.final_conv(img_feats[0]).permute(0, 4, 3, 2, 1)  # bncdhw->bnwhdc
+        volume_feat = self.final_conv(img_feats[0]).permute(0, 4, 3, 2, 1)  # to (b, 200, 200, 16, c)
         if self.use_predicter:
-            occ_pred = self.predicter(occ_pred)
+            volume_feat = self.predicter(volume_feat)  # (b, 200, 200, 16, c)
+        
         voxel_semantics = kwargs['voxel_semantics']
         mask_camera = kwargs['mask_camera']
         assert voxel_semantics.min() >= 0 and voxel_semantics.max() <= 17
 
         # occupancy losses
-        if self.NeRFDecoder.img_recon_head:
-            occ_pred = occ_pred[..., :-3]
-        loss_occ = self.loss_single(voxel_semantics, mask_camera, occ_pred)
+        _occ_pred = volume_feat[..., :self.num_classes]
+        loss_occ = self.loss_single(voxel_semantics, mask_camera, _occ_pred)
         losses.update(loss_occ)
 
         # NeRF loss
-        if True:  # DEBUG ONLY!
+        if False:  # DEBUG ONLY!
             voxel_semantics = kwargs['voxel_semantics'].unsqueeze(1) # (bs, 1, 200, 200, 16)
 
             density_prob = voxel_semantics != 17
@@ -587,7 +630,7 @@ class MyBEVStereo4DOCCNeRF(BEVStereo4D):
             exit()
 
         else:
-            occ_pred = occ_pred.permute(0, 4, 1, 2, 3)
+            occ_pred = volume_feat.permute(0, 4, 1, 2, 3)  # to (b, c, 200, 200, 16)
 
             # semantic
             if self.NeRFDecoder.semantic_head:
@@ -600,7 +643,7 @@ class MyBEVStereo4DOCCNeRF(BEVStereo4D):
 
             # image reconstruction
             if self.NeRFDecoder.img_recon_head:
-                rgb_recons = occ_pred[:, -4:-1, ...]
+                rgb_recons = occ_pred[:, -3:, ...]
             else:
                 rgb_recons = torch.zeros_like(density_prob)
 
@@ -611,7 +654,9 @@ class MyBEVStereo4DOCCNeRF(BEVStereo4D):
 
             # random view selection
             if self.num_random_view != -1:
-                rand_ind = torch.multinomial(torch.tensor([1/self.num_random_view]*self.num_random_view), self.num_random_view, replacement=False)
+                rand_ind = torch.multinomial(
+                    torch.tensor([1/self.num_random_view]*self.num_random_view), 
+                    self.num_random_view, replacement=False)
                 intricics = intricics[:, rand_ind]
                 pose_spatial = pose_spatial[:, rand_ind]
                 render_gt_depth = render_gt_depth[:, rand_ind]
@@ -626,7 +671,8 @@ class MyBEVStereo4DOCCNeRF(BEVStereo4D):
                 render_depth, rgb_pred, semantic_pred = self.NeRFDecoder(
                     density_prob_flip, rgb_flip, semantic_flip, 
                     intricics, pose_spatial, True, render_mask)
-                torch.cuda.synchronize()
+                
+                # torch.cuda.synchronize()
                 # end = time.time()
                 # print("inference time:", end - start)
 
@@ -650,9 +696,13 @@ class MyBEVStereo4DOCCNeRF(BEVStereo4D):
 
                 if self.NeRFDecoder.img_recon_head:
                     batch_size, num_camera = intricics.shape[:2]
-                    img_gts = render_img_gt.view(
-                        batch_size, num_camera, self.num_frame, -1, 
-                        render_img_gt.shape[-2], render_img_gt.shape[-1])[:, :, 0]
+                    if render_img_gt.shape[1] != num_camera:
+                        img_gts = render_img_gt.view(
+                            batch_size, num_camera, self.num_frame, -1, 
+                            render_img_gt.shape[-2], render_img_gt.shape[-1])[:, :, 0]
+                    else:
+                        img_gts = render_img_gt
+                    
                     img_gts = img_gts.permute(0, 1, 3, 4, 2)[render_mask]
                     loss_nerf_img = self.NeRFDecoder.compute_image_loss(
                         rgb_pred, img_gts)
@@ -663,30 +713,32 @@ class MyBEVStereo4DOCCNeRF(BEVStereo4D):
 
             else:
                 render_depth, rgb_pred, semantic_pred = self.NeRFDecoder(
-                    density_prob_flip, rgb_flip, 
-                    semantic_flip, intricics, pose_spatial, True)
+                    density_prob_flip, rgb_flip, semantic_flip, 
+                    intricics, pose_spatial, True, render_mask=None)
                 # torch.cuda.synchronize()
                 # end = time.time()
                 # print("inference time:", end - start)
 
                 # Upsample
                 batch_size, num_camera, _, H, W = rgb_pred.shape
-                depth_pred = F.interpolate(render_depth, 
-                                           size=[gt_depth.shape[-2], 
-                                                 gt_depth.shape[-1]], 
-                                           mode="bilinear", 
-                                           align_corners=False)
+                # depth_pred = F.interpolate(render_depth, 
+                #                            size=[gt_depth.shape[-2], 
+                #                                  gt_depth.shape[-1]], 
+                #                            mode="bilinear", 
+                #                            align_corners=False)
                 rgb_pred = F.upsample_bilinear(rgb_pred.view(batch_size * num_camera, -1, H, W), 
                                                size=[render_img_gt.shape[-2], 
-                                                     render_img_gt.shape[-1]]).view(batch_size, num_camera, -1, render_img_gt.shape[-2], render_img_gt.shape[-1])
-                semantic_pred = F.upsample_bilinear(
-                    semantic_pred.view(batch_size * num_camera, -1, H, W), 
-                    size=[gt_depth.shape[-2], 
-                          gt_depth.shape[-1]]).view(batch_size, 
-                                                    num_camera, 
-                                                    -1, 
-                                                    gt_depth.shape[-2], 
-                                                    gt_depth.shape[-1])
+                                                     render_img_gt.shape[-1]]).view(
+                                               batch_size, num_camera, -1, 
+                                               render_img_gt.shape[-2], render_img_gt.shape[-1])
+                # semantic_pred = F.upsample_bilinear(
+                #     semantic_pred.view(batch_size * num_camera, -1, H, W), 
+                #     size=[gt_depth.shape[-2], 
+                #           gt_depth.shape[-1]]).view(batch_size, 
+                #                                     num_camera, 
+                #                                     -1, 
+                #                                     gt_depth.shape[-2], 
+                #                                     gt_depth.shape[-1])
 
                 # Refine prediction
                 if self.refine_conv:
@@ -705,7 +757,8 @@ class MyBEVStereo4DOCCNeRF(BEVStereo4D):
                     semantic_pred = semantic_pred.view(batch_size, num_camera, -1, gt_depth.shape[-2], gt_depth.shape[-1])
 
                 # nerf loss calculation
-                loss_nerf = self.NeRFDecoder.compute_depth_loss(depth_pred, render_gt_depth, render_gt_depth > 0.0)
+                loss_nerf = self.NeRFDecoder.compute_depth_loss(
+                    render_depth, render_gt_depth, render_gt_depth > 0.0)
                 if torch.isnan(loss_nerf):
                     print('NaN in DepthNeRF loss!')
                     loss_nerf = loss_depth
@@ -722,7 +775,13 @@ class MyBEVStereo4DOCCNeRF(BEVStereo4D):
                     losses['loss_nerf_sem'] = loss_nerf_sem
 
                 if self.NeRFDecoder.img_recon_head:
-                    img_gts = render_img_gt.view(batch_size, num_camera, self.num_frame, -1, render_img_gt.shape[-2], render_img_gt.shape[-1])[:, :, 0]
+                    if render_img_gt.shape[1] != num_camera:
+                        img_gts = render_img_gt.view(
+                            batch_size, num_camera, self.num_frame, -1, 
+                            render_img_gt.shape[-2], render_img_gt.shape[-1])[:, :, 0]
+                    else:
+                        img_gts = render_img_gt
+
                     loss_nerf_img = self.NeRFDecoder.compute_image_loss(rgb_pred, img_gts)
                     if torch.isnan(loss_nerf):
                         print('NaN in ImgNeRF loss!')

@@ -219,19 +219,19 @@ def save_all_cam_cat_images(anno_file, save_root=None):
     
     cam_img_size = [480, 270]  # [w, h]
     for idx, info in tqdm(enumerate(data_infos), total=len(data_infos)):
-        cam_names = info['cams']
+        cam_info = info['cams']
+        # 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'
 
         cam_imgs = []
-        for cam_name in cam_names:
-            cam_data = cam_names[cam_name]
+        for cam_name in cam_info.keys():
+            cam_data = cam_info[cam_name]
             filename = cam_data['data_path']
-            cam_token = cam_data['sample_data_token']
 
             cam_img_resized = Image.open(filename).resize(
                 cam_img_size, Image.BILINEAR)
             cam_imgs.append(cam_img_resized)
         
-        spacing = 10
+        spacing = 5
         cam_w, cam_h = cam_img_size
         result_w = cam_w * 3 + 2 * spacing
         result_h = cam_h * 2 + 1 * spacing
@@ -241,8 +241,8 @@ def save_all_cam_cat_images(anno_file, save_root=None):
         result.paste(cam_imgs[1], box=(2*cam_w+2*spacing, 0))
         result.paste(cam_imgs[2], box=(0, 0))
         result.paste(cam_imgs[3], box=(1*cam_w+1*spacing, 1*cam_h+1*spacing))
-        result.paste(cam_imgs[4], box=(0, 1*cam_h+1*spacing))
-        result.paste(cam_imgs[5], box=(2*cam_w+2*spacing, 1*cam_h+1*spacing))
+        result.paste(cam_imgs[5], box=(0, 1*cam_h+1*spacing))
+        result.paste(cam_imgs[4], box=(2*cam_w+2*spacing, 1*cam_h+1*spacing))
 
         if save_root is not None:
             # create the camera image directory
@@ -1015,6 +1015,8 @@ def save_scene_sequence_image(anno_file):
 
 if __name__ == "__main__":
     pickle_path = "data/nuscenes/bevdetv3-lidarseg-nuscenes_infos_val.pkl"
+    save_all_cam_cat_images(pickle_path, save_root="./aaai_all_validation_cat_debug")
+    exit(0)
 
     # save_projected_point_cloud(pickle_path, sample_idx=4540)
     # exit()
@@ -1041,8 +1043,7 @@ if __name__ == "__main__":
     save_scene_sequence_image(pickle_path)
     exit(0)
 
-    save_all_cam_cat_images(pickle_path, save_root="./aaai_all_validation_cat_debug")
-    exit(0)
+    
 
     
 

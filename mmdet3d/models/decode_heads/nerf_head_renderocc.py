@@ -15,26 +15,11 @@ import cv2
 import os
 import os.path as osp
 import time
-from PIL import Image
-from torch_scatter import segment_coo
 from mmdet3d.models.builder import HEADS
 from mmdet3d.models.losses.lovasz_loss import lovasz_softmax
-from mmdet3d.models.nerf.utils import Raw2Alpha, Alphas2Weights
+from ..nerf.utils import Raw2Alpha, Alphas2Weights, ub360_utils_cuda, silog_loss
+from torch_scatter import segment_coo
 
-
-def denormalize(img, flip_rgb=True):
-    img_mean = np.array([0.485, 0.456, 0.406])[None, None, :]
-    img_std = np.array([0.229, 0.224, 0.225])[None, None, :]
-    img = np.ascontiguousarray((img * img_std + img_mean))
-    if flip_rgb:
-        img = img[..., ::-1]
-    return img
-
-
-def get_time_str():
-    now = time.time()
-    filename = time.strftime("%Y%m%d_%H%M%S_%f", time.localtime(now))
-    return filename
 
 def visualize_depth(depth, mask=None, depth_min=None, depth_max=None, direct=False):
     """Visualize the depth map with colormap.
@@ -113,27 +98,6 @@ def get_rays_of_a_view(H, W, K, c2w, inverse_y, flip_x, flip_y, mode='center'):
 
     return rays_o_all, rays_d_all
 
-
-class SingleVarianceNetwork(nn.Module):
-    """Variance network in NeuS"""
-
-    def __init__(self, init_val):
-        super(SingleVarianceNetwork, self).__init__()
-        self.register_parameter(
-            "variance", nn.Parameter(init_val * torch.ones(1), requires_grad=True)
-        )
-
-    def forward(self, x):
-        """Returns current variance value"""
-        return torch.ones([len(x), 1], device=x.device) * torch.exp(
-            self.variance * 10.0
-        )
-
-    def get_variance(self):
-        """return current variance value"""
-        return torch.exp(self.variance * 10.0).clip(1e-6, 1e6)
-
-
 @HEADS.register_module()
 class NeRFDecoderHead(nn.Module):
     def __init__(self, 
@@ -141,15 +105,9 @@ class NeRFDecoderHead(nn.Module):
                  stepsize, 
                  voxels_size, 
                  render_size, 
-                 depth_range, 
-                 render_type, 
-                 mode, 
-                 loss_nerf_weight, 
-                 depth_loss_type, 
-                 variance_focus,
-                 depth_loss_weight=1.0,
-                 img_loss_weight=1.0,
-                 sem_loss_weight=1.0,
+                 depth_range, render_type, 
+                 mode, loss_nerf_weight, 
+                 depth_loss_type, variance_focus,
                  img_recon_head=False, 
                  semantic_head=False, 
                  semantic_dim=17, 
@@ -177,22 +135,16 @@ class NeRFDecoderHead(nn.Module):
         self.semantic_dim = semantic_dim
         self.variance_focus = variance_focus
         self.depth_loss_type = depth_loss_type
-        self.depth_loss_weight = depth_loss_weight
-        self.img_loss_weight = img_loss_weight
-        self.sem_loss_weight = sem_loss_weight
         self.loss_weight = loss_nerf_weight
         self.stepsize = stepsize
         self.render_type = render_type
         self.num_voxels = voxels_size[0] * voxels_size[1] * voxels_size[2]
         self.voxel_size = ((self.xyz_max - self.xyz_min).prod() / self.num_voxels).pow(1 / 3)
-        # print('voxel_size', self.voxel_size)
+        print('voxel_size', self.voxel_size)
 
         N_samples = int(np.linalg.norm(np.array([voxels_size[0] // 2, voxels_size[1] // 2, voxels_size[2] // 2]) + 1) / self.stepsize) + 1
         self.register_buffer('rng', torch.arange(N_samples)[None].float())
-
-        if self.render_type == 'neus':
-            # deviation_network to compute alpha from sdf from NeuS
-            self.deviation_network = SingleVarianceNetwork(init_val=0.3)
+        print('rng', self.rng)
 
     def grid_sampler(self, xyz, grid, align_corners=True, mode='bilinear'):
         '''Wrapper for the interp operation'''
@@ -204,31 +156,6 @@ class NeRFDecoderHead(nn.Module):
         ret_lst = ret_lst.reshape(grid.shape[1], -1).T.reshape(*shape, grid.shape[1]).squeeze()
         return ret_lst
 
-    def interpolate_feats(self, xyz, feats_volume):
-        from smooth_sampler import SmoothSampler
-        
-        shape = xyz.shape[:-1]
-        xyz = xyz.reshape(1, 1, 1, -1, 3)
-        feats_volume = feats_volume.unsqueeze(0)
-        ind_norm = ((xyz - self.xyz_min) / (self.xyz_max - self.xyz_min)).flip((-1,)) * 2 - 1  # XYZ
-        if False:
-            from mmdet3d.ops.cuda_gridsample_grad2 import cuda_gridsample as cudagrid
-            feats = cudagrid.grid_sample_3d(
-                feats_volume, ind_norm.float(), align_corners=True, padding_mode="border"
-            )
-            feats = feats.reshape(feats_volume.shape[1], -1).T.reshape(*shape, feats_volume.shape[1]).squeeze()
-        else:
-            feats = SmoothSampler.apply(
-                    feats_volume,
-                    ind_norm.float(),
-                    "zeros",
-                    True,
-                    False,
-                )
-        
-        feats = feats.reshape(feats_volume.shape[1], -1).T.reshape(*shape, feats_volume.shape[1]).squeeze()
-        return feats
-    
     @staticmethod
     def construct_ray_warps(fn, t_near, t_far):
         """Construct a bijection between metric distances and normalized distances.
@@ -299,15 +226,15 @@ class NeRFDecoderHead(nn.Module):
         """_summary_
 
         Args:
-            rays_o (_type_): (num_cam, h, w, 3)
-            rays_d (_type_): (num_cam, h, w, 3)
+            rays_o (_type_): _description_
+            rays_d (_type_): _description_
             voxel (_type_): _description_
             rgb_recon (_type_): _description_
             semantic_recon (_type_): _description_
             is_train (bool): _description_
             mode (_type_): _description_
             nonlinear_sample (bool, optional): _description_. Defaults to False.
-            render_mask (_type_, optional): (num_cam, h, w). Defaults to None.
+            render_mask (_type_, optional): _description_. Defaults to None.
             return_weights (bool, optional): _description_. Defaults to False.
             force_render_rgb (bool, optional): Whether force enabling the rgb rendering,
                 it's useful when rendering some RGB image for visualization. Defaults to False.
@@ -325,14 +252,10 @@ class NeRFDecoderHead(nn.Module):
             else:
                 rays_o_i = rays_o[render_mask]
                 rays_d_i = rays_d[render_mask]
-            rays_pts, mask_outbbox, interval, rays_pts_depth = self.sample_ray(
-                rays_o_i, rays_d_i, is_train=is_train, nonlinear_sample=nonlinear_sample)
+            rays_pts, mask_outbbox, interval, rays_pts_depth = self.sample_ray(rays_o_i, rays_d_i, is_train=is_train, nonlinear_sample=nonlinear_sample)
 
         mask_rays_pts = rays_pts[~mask_outbbox]
-        mask_rays_pts.requires_grad_(True)
         density = self.grid_sampler(mask_rays_pts, voxel, mode=mode)
-        # with torch.enable_grad():
-        #     density = self.interpolate_feats(mask_rays_pts, voxel)
 
         if self.render_type == 'prob':
             probs = torch.zeros_like(rays_pts[..., 0])
@@ -342,8 +265,6 @@ class NeRFDecoderHead(nn.Module):
             probs = probs.cumsum(dim=1).clamp(max=1)
             probs = probs.diff(dim=1, prepend=torch.zeros((rays_pts.shape[:1])).unsqueeze(1).to('cuda'))
             depth = (probs * interval).sum(-1)
-
-            # np.save("ray_weight_probs_frame25_student.npy", probs.cpu().numpy())
 
             if force_render_rgb or self.img_recon_head:
                 rgb = self.grid_sampler(mask_rays_pts, rgb_recon)
@@ -363,7 +284,7 @@ class NeRFDecoderHead(nn.Module):
                 semantic_marched = depth
 
         elif self.render_type == 'DVGO':
-            ## adapted from the RenderOcc
+
             probs = torch.zeros_like(rays_pts[..., 0])
             probs[:, -1] = 1
             probs[~mask_outbbox] = density
@@ -371,96 +292,14 @@ class NeRFDecoderHead(nn.Module):
             alpha = Raw2Alpha.apply(probs.flatten(), 0, 0.5)
             ray_id = torch.arange(rays_pts.shape[:2][0]).view(-1, 1).expand(rays_pts.shape[:2]).flatten().to(alpha.device)
             weights, alphainv_last = Alphas2Weights.apply(alpha, ray_id.to(alpha.device), len(rays_pts))
+            weights = (weights.reshape(probs.shape) * interval).reshape(-1)
             depth = segment_coo(
-                src=(weights.reshape(probs.shape) * interval).reshape(-1),
+                src=weights,
                 index=ray_id,
                 out=torch.zeros([len(rays_pts)]).to(weights.device),
                 reduce='sum') + 1e-7
-            
-            if self.semantic_head:
-                semantic = self.grid_sampler(mask_rays_pts, semantic_recon)
-                B, N = rays_pts.shape[:2]
-                semantic_cache = torch.zeros((B, N, semantic_recon.shape[0])).to(rays_pts.device)
-                semantic_cache[~mask_outbbox] = semantic
-
-                semantic_marched = segment_coo(
-                    src=(weights.reshape(probs.shape).unsqueeze(-1) * semantic_cache).reshape((-1, semantic.shape[-1])),
-                    index=ray_id,
-                    out=torch.zeros([len(rays_pts), semantic.shape[-1]]).to(weights.device),
-                    reduce='sum')
-            else:
-                semantic_marched = depth
-            
-            rgb_marched = depth  # TODO: add rgb_marched
-        elif self.render_type == 'neus':
-            z_vals = interval.expand(rays_pts.shape[:2])
-            dists = z_vals[..., 1:] - z_vals[..., :-1]
-            dists = torch.cat([dists, dists[0, -1].expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
-            dists = dists[~mask_outbbox]
-            
-            sdf = density  # (N, M)
-            sdf = sdf[..., None]
-
-            d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
-            gradients = torch.autograd.grad(
-                outputs=sdf,
-                inputs=mask_rays_pts,
-                grad_outputs=d_output,
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True,
-            )[0]
-
-            inv_s = self.deviation_network.get_variance()  # Single parameter
-            
-            dirs = rays_d_i[:, None].expand(rays_pts.shape)[~mask_outbbox]
-            true_cos = (dirs * gradients).sum(-1, keepdim=True)
-
-            cos_anneal_ratio = 1.0
-            # "cos_anneal_ratio" grows from 0 to 1 in the beginning training iterations. The anneal strategy below makes
-            # the cos value "not dead" at the beginning training iterations, for better convergence.
-            iter_cos = -(F.relu(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) +
-                        F.relu(-true_cos) * cos_anneal_ratio)  # always non-positive
-
-            # Estimate signed distances at section points
-            estimated_next_sdf = sdf + iter_cos * dists.reshape(-1, 1) * 0.5
-            estimated_prev_sdf = sdf - iter_cos * dists.reshape(-1, 1) * 0.5
-
-            prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
-            next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
-
-            p = prev_cdf - next_cdf
-            c = prev_cdf
-
-            alpha = ((p + 1e-5) / (c + 1e-5)).clip(0.0, 1.0)
-
-            alpha_raw = torch.zeros_like(rays_pts[..., 0])
-            alpha_raw[~mask_outbbox] = alpha[:, 0]  # (N, M)
-            transmittance = torch.cumprod(
-                torch.cat([torch.ones([*alpha_raw.shape[:1], 1], device=alpha_raw.device), 
-                           1. - alpha_raw + 1e-7], -1), -1)
-            weights = alpha_raw * transmittance[:, :-1]
-            
-            eps = 1e-10
-            depth = torch.sum(weights * interval, dim=1) / (torch.sum(weights, 1) + eps)
-            depth = torch.clip(depth, interval.min(), interval.max())
-
-            if self.semantic_head:
-                semantic = self.interpolate_feats(mask_rays_pts, semantic_recon)
-
-                B, N = rays_pts.shape[:2]
-                semantic_cache = torch.zeros((B, N, semantic_recon.shape[0])).to(rays_pts.device)
-                semantic_cache[~mask_outbbox] = semantic  # (N, C)
-                semantic_marched = torch.sum(weights[..., None] * semantic_cache, -2)
-            else:
-                semantic_marched = depth
-
-            # eikonal_loss
-            eikonal_loss = ((gradients.norm(2, dim=-1) - 1) ** 2).mean()
-            loss_dict = dict()
-            loss_dict['eikonal_loss'] = eikonal_loss
-
-            rgb_marched = depth  # TODO: add rgb_marched
+            semantic_marched = depth
+            rgb_marched = depth
 
         elif self.render_type == 'density':
             # torch.cuda.synchronize()
@@ -474,7 +313,6 @@ class NeRFDecoderHead(nn.Module):
 
             if force_render_rgb or self.img_recon_head:
                 rgb = self.grid_sampler(mask_rays_pts, rgb_recon)
-                rgb = torch.sigmoid(rgb)  # use the sigmoid activation function for RGB
                 rgb_cache = torch.zeros_like(rays_pts)
                 rgb_cache[~mask_outbbox] = rgb  # 473088, 287, 3
                 rgb_marched = torch.sum(weights[..., None] * rgb_cache, -2)
@@ -513,16 +351,17 @@ class NeRFDecoderHead(nn.Module):
             depth_est = (1 / depth_est) * self.max_depth
             depth_gt = (1 / depth_gt) * self.max_depth
             loss = F.l1_loss(depth_est[mask], depth_gt[mask], size_average=True)
+
         elif self.depth_loss_type == 'sml1':
             loss = F.smooth_l1_loss(depth_est[mask], depth_gt[mask], size_average=True)
         else:
             raise NotImplementedError()
 
-        return self.depth_loss_weight * loss
+        return self.loss_weight * loss
 
     def compute_image_loss(self, image_est, image_gt):
         loss = F.smooth_l1_loss(image_est, image_gt, size_average=True)
-        return self.img_loss_weight * loss
+        return self.loss_weight * loss
 
     def compute_semantic_loss_flatten(self, sem_est, sem_gt, lovasz=False):
         '''
@@ -533,7 +372,7 @@ class NeRFDecoderHead(nn.Module):
         loss = F.cross_entropy(sem_est, sem_gt.long(), ignore_index=255)
         if lovasz:
             loss += lovasz_softmax(sem_est, sem_gt.long(), ignore=255)
-        return self.sem_loss_weight * loss
+        return self.loss_weight * loss
 
     def compute_semantic_loss(self, sem_est, sem_gt, lovasz=False):
         '''
@@ -549,7 +388,7 @@ class NeRFDecoderHead(nn.Module):
         loss = F.cross_entropy(sem_est, sem_gt.long(), ignore_index=255)
         if lovasz:
             loss += lovasz_softmax(sem_est, sem_gt.long(), per_image=True, ignore=255)
-        return self.sem_loss_weight * loss
+        return self.loss_weight * loss
 
 
     def forward(self, 
@@ -631,21 +470,15 @@ class NeRFDecoderHead(nn.Module):
         
         if return_weights:
             return batch_depth, batch_rgb, batch_semantic, batch_weights
-        
-        batch_rgb = batch_rgb.clamp(0.0, 1.0)
         return batch_depth, batch_rgb, batch_semantic
 
 
-    def visualize_image_depth_pair(self, 
-                                   images, 
-                                   depth_gt, 
-                                   render,
-                                   save_dir=None):
+    def visualize_image_depth_pair(self, images, depth, render):
         '''
-        Visualize the camera image, sparse GT depth and the rendered dense depth map.
+        This is a debug function!!
         Args:
             images: num_camera, 3, H, W
-            depth_gt: num_camera, H, W, the sparse depth projected by point cloud.
+            depth: num_camera, H, W
             render: num_camera, H, W
         '''
         import matplotlib.pyplot as plt
@@ -653,11 +486,11 @@ class NeRFDecoderHead(nn.Module):
 
         concated_render_list = []
         concated_image_list = []
-        depth_gt = depth_gt.detach().cpu().numpy()
-        render = render.detach().cpu().numpy()
+        depth = depth.cpu().numpy()
+        render = render.cpu().numpy()
 
         for b in range(len(images)):
-            visual_img = cv2.resize(images[b].transpose((1, 2, 0)), (depth_gt.shape[-1], depth_gt.shape[-2]))
+            visual_img = cv2.resize(images[b].transpose((1, 2, 0)), (depth.shape[-1], depth.shape[-2]))
             img_mean = np.array([0.485, 0.456, 0.406])[None, None, :]
             img_std = np.array([0.229, 0.224, 0.225])[None, None, :]
             visual_img = np.ascontiguousarray((visual_img * img_std + img_mean))
@@ -665,10 +498,9 @@ class NeRFDecoderHead(nn.Module):
             concated_image_list.append(visual_img)
             pred_depth_color = visualize_depth(render[b])
             pred_depth_color = pred_depth_color[..., [2, 1, 0]]
-            concated_render_list.append(
-                cv2.resize(pred_depth_color.copy(), (depth_gt.shape[-1], depth_gt.shape[-2])))
+            concated_render_list.append(cv2.resize(pred_depth_color.copy(), (depth.shape[-1], depth.shape[-2])))
 
-        normalized_voxel_depth = normalize_depth(depth_gt, d_min=self.min_depth, d_max=self.max_depth)
+        normalized_voxel_depth = normalize_depth(depth, d_min=self.min_depth, d_max=self.max_depth)
         fig, ax = plt.subplots(nrows=6, ncols=3, figsize=(6, 6))
         ij = [[i, j] for i in range(2) for j in range(3)]
         for i in range(len(ij)):
@@ -678,111 +510,23 @@ class NeRFDecoderHead(nn.Module):
             ax[ij[i][0], ij[i][1]].imshow(concated_image_list[i])
             ax[ij[i][0] + 2, ij[i][1]].imshow(np.ones_like(concated_render_list[i]) * 255)
             ax[ij[i][0] + 2, ij[i][1]].scatter(normalized_voxel_depth[i].nonzero()[1],
-                                               normalized_voxel_depth[i].nonzero()[0], 
-                                               c=colors_voxel, alpha=0.5, s=0.5)
+                                               normalized_voxel_depth[i].nonzero()[0], c=colors_voxel, alpha=0.5, s=0.5)
             ax[ij[i][0] + 4, ij[i][1]].imshow(concated_render_list[i])
 
             for j in range(3):
                 ax[i, j].axis('off')
 
         plt.subplots_adjust(wspace=0.01, hspace=0.01)
+        plt.show()
+        # plt.savefig("lidar_occ_nerf_infer_debug.png")
 
-        save_dir = "./results" if save_dir is None else save_dir
-        os.makedirs(save_dir, exist_ok=True)
-
-        full_img_path = osp.join(save_dir, f"image_depth_pair_{time.time()}.png")
-        plt.savefig(full_img_path)
-
-    def visualize_sparse_depth_semantic(self, 
-                                        images, 
-                                        sparse_depth, 
-                                        sparse_sem,
-                                        save_dir=None):
+    def visualize_image_and_render_depth_pair(self, images, render_gt, render):
         '''
-        Visualize the camera image, sparse GT depth and the rendered dense depth map.
+        This is a debug function!!
         Args:
             images: num_camera, 3, H, W
-            sparse_depth: num_camera, H, W, the sparse depth projected by point cloud.
-            sparse_sem: num_camera, H, W
-        '''
-        import matplotlib.pyplot as plt
-        from mmdet3d.utils import turbo_colormap_data, normalize_depth, interpolate_or_clip
-
-        OCC3D_PALETTE = torch.Tensor([
-            [0, 0, 0],
-            [255, 120, 50],  # barrier              orangey
-            [255, 192, 203],  # bicycle              pink
-            [255, 255, 0],  # bus                  yellow
-            [0, 150, 245],  # car                  blue
-            [0, 255, 255],  # construction_vehicle cyan
-            [200, 180, 0],  # motorcycle           dark orange
-            [255, 0, 0],  # pedestrian           red
-            [255, 240, 150],  # traffic_cone         light yellow
-            [135, 60, 0],  # trailer              brown
-            [160, 32, 240],  # truck                purple
-            [255, 0, 255],  # driveable_surface    dark pink
-            [139, 137, 137], # other_flat           dark grey
-            [75, 0, 75],  # sidewalk             dard purple
-            [150, 240, 80],  # terrain              light green
-            [230, 230, 250],  # manmade              white
-            [0, 175, 0],  # vegetation           green
-            [0, 0, 0],  # free black
-        ])
-
-        concated_image_list = []
-        depth_gt = sparse_depth.detach().cpu().numpy()
-
-        for b in range(len(images)):
-            visual_img = cv2.resize(images[b].transpose((1, 2, 0)), 
-                                    (depth_gt.shape[-1], depth_gt.shape[-2]))
-            visual_img = denormalize(visual_img)
-            concated_image_list.append(visual_img)
-
-        normalized_voxel_depth = normalize_depth(depth_gt, d_min=self.min_depth, d_max=self.max_depth)
-        
-        fig, ax = plt.subplots(nrows=6, ncols=3, figsize=(6, 6))
-        ij = [[i, j] for i in range(2) for j in range(3)]
-        for i in range(len(ij)):
-            colors_voxel = []
-            for depth_val in normalized_voxel_depth[i][normalized_voxel_depth[i] > 0].reshape(-1):
-                colors_voxel.append(interpolate_or_clip(colormap=turbo_colormap_data, x=depth_val))
-            ax[ij[i][0], ij[i][1]].imshow(concated_image_list[i])
-            ax[ij[i][0] + 2, ij[i][1]].imshow(np.ones_like(concated_image_list[i]) * 255)
-            ax[ij[i][0] + 2, ij[i][1]].scatter(normalized_voxel_depth[i].nonzero()[1],
-                                               normalized_voxel_depth[i].nonzero()[0], 
-                                               c=colors_voxel, alpha=0.5, s=0.5)
-            colors_voxel = []
-            for sem_val in sparse_sem[i][normalized_voxel_depth[i] > 0].reshape(-1):
-                colors_voxel.append((OCC3D_PALETTE[sem_val] / 255.0).tolist())
-            ax[ij[i][0] + 4, ij[i][1]].imshow(np.ones_like(concated_image_list[i]) * 255)
-            ax[ij[i][0] + 4, ij[i][1]].scatter(normalized_voxel_depth[i].nonzero()[1],
-                                               normalized_voxel_depth[i].nonzero()[0], 
-                                               c=colors_voxel, alpha=0.5, s=0.5)
-
-            for j in range(3):
-                ax[i, j].axis('off')
-
-        plt.subplots_adjust(wspace=0.01, hspace=0.01)
-
-        save_dir = "./results" if save_dir is None else save_dir
-        os.makedirs(save_dir, exist_ok=True)
-        
-        full_img_path = osp.join(save_dir, f"image_depth_pair_{time.time()}.png")
-        plt.savefig(full_img_path)
-
-
-    def visualize_image_and_render_depth_pair(self, 
-                                              images, 
-                                              render_gt_depth, 
-                                              render_depth,
-                                              save_path=None):
-        '''
-        Visualize the input RGB image and the rendered dense depth from gt and from
-        prediction.
-        Args:
-            images: num_camera, 3, H, W, [0, 1].
-            render_gt_depth: num_camera, H, W
-            render_depth: num_camera, H, W, dense depth with meters scale.
+            render_gt: num_camera, H, W
+            render: num_camera, H, W
         '''
         import matplotlib.pyplot as plt
 
@@ -790,28 +534,25 @@ class NeRFDecoderHead(nn.Module):
         concated_render_gt_list= []
         concated_image_list = []
         
-        render_depth = render_depth.detach().cpu().numpy()
-        render_gt_depth = render_gt_depth.detach().cpu().numpy()
+        depth = render_gt
+        depth = depth.cpu().numpy()
+        render = render.cpu().numpy()
+        render_gt = render_gt.cpu().numpy()
 
         for b in range(len(images)):
-            visual_img = cv2.resize(images[b].transpose((1, 2, 0)), 
-                                    (render_depth.shape[-1], render_depth.shape[-2]))
+            visual_img = cv2.resize(images[b].transpose((1, 2, 0)), (depth.shape[-1], depth.shape[-2]))
             img_mean = np.array([0.485, 0.456, 0.406])[None, None, :]
             img_std = np.array([0.229, 0.224, 0.225])[None, None, :]
             visual_img = np.ascontiguousarray((visual_img * img_std + img_mean))
+
             concated_image_list.append(visual_img)
-
-            pred_depth_color = visualize_depth(render_depth[b])
+            pred_depth_color = visualize_depth(render[b])
             pred_depth_color = pred_depth_color[..., [2, 1, 0]]
-            concated_render_list.append(
-                cv2.resize(pred_depth_color.copy(), 
-                           (render_depth.shape[-1], render_depth.shape[-2])))
+            concated_render_list.append(cv2.resize(pred_depth_color.copy(), (depth.shape[-1], depth.shape[-2])))
 
-            pred_depth_color = visualize_depth(render_gt_depth[b])
+            pred_depth_color = visualize_depth(render_gt[b])
             pred_depth_color = pred_depth_color[..., [2, 1, 0]]
-            concated_render_gt_list.append(
-                cv2.resize(pred_depth_color.copy(), 
-                           (render_depth.shape[-1], render_depth.shape[-2])))
+            concated_render_gt_list.append(cv2.resize(pred_depth_color.copy(), (depth.shape[-1], depth.shape[-2])))
 
         fig, ax = plt.subplots(nrows=6, ncols=3, figsize=(6, 6))
         ij = [[i, j] for i in range(2) for j in range(3)]
@@ -826,11 +567,7 @@ class NeRFDecoderHead(nn.Module):
 
         plt.subplots_adjust(wspace=0.01, hspace=0.01)
         # plt.show()
-        save_dir= "./results"
-        os.makedirs(save_dir, exist_ok=True)
-        full_img_path = osp.join(save_dir, f"rendered_depth_{time.time()}.png") \
-            if save_path is None else save_path
-        plt.savefig(full_img_path)
+        plt.savefig("lidar_occ_nerf_render_infer_error.png")
 
 
     def visualize_image_semantic_depth_pair(self, 
@@ -850,13 +587,8 @@ class NeRFDecoderHead(nn.Module):
 
         concated_render_list = []
         concated_image_list = []
-        
-        ## check if is Tensor, if not, convert to Tensor
-        if torch.is_tensor(semantic):
-            semantic = semantic.detach().cpu().numpy()
-        
-        if torch.is_tensor(render):
-            render = render.detach().cpu().numpy()
+        semantic = semantic.cpu().numpy()
+        render = render.cpu().numpy()
 
         for b in range(len(images)):
             visual_img = cv2.resize(images[b].transpose((1, 2, 0)), (semantic.shape[-2], semantic.shape[-3]))
@@ -873,7 +605,7 @@ class NeRFDecoderHead(nn.Module):
         fig, ax = plt.subplots(nrows=6, ncols=3, figsize=(6, 6))
         ij = [[i, j] for i in range(2) for j in range(3)]
         for i in range(len(ij)):
-            ax[ij[i][0], ij[i][1]].imshow(concated_image_list[i][..., ::-1])
+            ax[ij[i][0], ij[i][1]].imshow(concated_image_list[i])
             ax[ij[i][0] + 2, ij[i][1]].imshow(semantic[i]/255)
             ax[ij[i][0] + 4, ij[i][1]].imshow(concated_render_list[i]/255)
 
@@ -914,3 +646,83 @@ class NeRFDecoderHead(nn.Module):
                 np.save(save_depth_path, rendered_depth)
         else:
             plt.show()
+
+if __name__ == '__main__':
+    import time
+    from easydict import EasyDict
+
+    rays_o = torch.load('/home/huawei/yanxu/codes/SimpleOccupancy/networks/input_samples/rays_o.pth').cuda()
+    rays_d = torch.load('/home/huawei/yanxu/codes/SimpleOccupancy/networks/input_samples/rays_d.pth').cuda()
+    intricics = torch.load("/home/huawei/yanxu/codes/SimpleOccupancy/networks/input_samples/('K_render', 0, 0).pth").cuda().unsqueeze(0)
+    pose_spatial = torch.load('/home/huawei/yanxu/codes/SimpleOccupancy/networks/input_samples/pose_spatial.pth').cuda().unsqueeze(0)
+    gt_semantics = torch.load('/home/huawei/yanxu/codes/SimpleOccupancy/networks/input_samples/gt_semantics.pth').cuda()
+    print('rays_o', rays_o.shape)  # torch.Size([1, 6, 224, 352, 3])
+    print('rays_d', rays_o.shape)  # torch.Size([1, 6, 224, 352, 3])
+    print('intricics', intricics.shape)  # torch.Size([1, 6, 4, 4])
+    print('pose_spatial', pose_spatial.shape)  # torch.Size([1, 6, 4, 4])
+    print('gt_semantics', gt_semantics.shape)
+    density_prob = (gt_semantics.unsqueeze(0).unsqueeze(0) != 17).float()
+    density_prob[density_prob == 0] = -10 # scaling to avoid 0 in alphas
+    density_prob[density_prob == 1] = 10
+    print('density_prob', density_prob.shape)  # torch.Size([1, 1, 200, 200, 16])
+
+    config = {
+        'real_size': [-40, 40, -40, 40, -1, 5.4],
+        'voxels_size': [200, 200, 16],
+        'stepsize': 1,
+        # 'mode': 'nearest',
+        'mode': 'bilinear',
+        'render_type': 'prob',
+        # 'render_type': 'density',
+        'render_w': 352,
+        'render_h': 224,
+        'min_depth': 0.1,
+        'max_depth': 100.0,
+        'loss_nerf_weight': 1,
+        'depth_loss_type': 'l1',
+        'variance_focus': 0.85,
+        'img_recon_head': False,
+        'semantic_head': False,
+        'semantic_dim': 17,
+    }
+    config = EasyDict(config)
+
+    # test batchify
+    density_prob, rays_o, rays_d = density_prob.repeat(2, 1, 1, 1, 1), rays_o.repeat(2, 1, 1, 1, 1), rays_d.repeat(2, 1, 1, 1, 1)
+    intricics, pose_spatial = intricics.repeat(2, 1, 1, 1), pose_spatial.repeat(2, 1, 1, 1)
+
+    # nerf loss
+
+    nerf = NeRFDecoder(
+        real_size=config.real_size,
+        stepsize=config.stepsize,
+        voxels_size=config.voxels_size,
+        mode=config.mode,
+        render_type=config.render_type,
+        render_size=(config.render_h, config.render_w),
+        depth_range=(config.min_depth, config.max_depth),
+        loss_nerf_weight=config.loss_nerf_weight,
+        depth_loss_type=config.depth_loss_type,
+        variance_focus=config.variance_focus,
+        img_recon_head=config.img_recon_head,
+        semantic_head=config.semantic_head,
+        semantic_dim=config.semantic_dim,
+    ).cuda()
+
+    torch.cuda.synchronize()
+    start = time.time()
+    depth, _, _ = nerf(
+        density_prob,
+        density_prob.tile(1, 3, 1, 1, 1),
+        density_prob.tile(1, 17, 1, 1, 1),
+        intricics, pose_spatial)
+    torch.cuda.synchronize()
+    end = time.time()
+    print("inference time:", end - start)
+
+    print('depth', depth.shape, depth.max(), depth.min())
+
+    images = torch.load("/home/huawei/yanxu/codes/SimpleOccupancy/networks/input_samples/('color', 0, 0).pth").cpu().numpy()
+    print('images', images.shape)
+
+    nerf.visualize_image_depth_pair(images, depth[0], depth[0])

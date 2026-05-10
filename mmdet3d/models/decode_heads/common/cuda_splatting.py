@@ -1,4 +1,5 @@
-from math import isqrt
+# from math import isqrt
+import math
 from typing import Literal
 
 import torch
@@ -7,7 +8,6 @@ from diff_gauss import (
     GaussianRasterizer,
 )
 from einops import einsum, rearrange, repeat
-from jaxtyping import Float
 from torch import Tensor
 
 from .projection import get_fov, homogenize_points
@@ -72,7 +72,7 @@ def render_cuda(
         far = far * scale
 
     _, _, _, n = gaussian_sh_coefficients.shape
-    degree = isqrt(n) - 1
+    degree = math.floor(math.sqrt(n)) - 1
     shs = rearrange(gaussian_sh_coefficients, "b g xyz n -> b g n xyz").contiguous()
 
     b, _, _ = extrinsics.shape
@@ -88,7 +88,6 @@ def render_cuda(
     full_projection = view_matrix @ projection_matrix
 
     all_images = []
-    all_radii = []
     all_depth = []
     all_feats = []
     for i in range(b):
@@ -117,38 +116,37 @@ def render_cuda(
 
         row, col = torch.triu_indices(3, 3)
 
-        if feats3D is None:
-            image, radii, depth = rasterizer(
-                means3D=gaussian_means[i],
-                means2D=mean_gradients,
-                shs=shs[i] if use_sh else None,
-                colors_precomp=None if use_sh else shs[i, :, 0, :],
-                opacities=gaussian_opacities[i, ..., None],
-                cov3D_precomp=gaussian_covariances[i, :, row, col],
-            )
-        else:
-            image, feats, depth, alpha, radii = rasterizer(
-                means3D=gaussian_means[i],
-                means2D=mean_gradients,
-                shs=shs[i] if use_sh else None,
-                colors_precomp=None if use_sh else shs[i, :, 0, :],
-                opacities=gaussian_opacities[i, ..., None],
-                cov3D_precomp=gaussian_covariances[i, :, row, col],
-                feats3D=feats3D[i],
-            )
-            all_feats.append(feats)
+        _feats3D = None if feats3D is None else feats3D[i]
+        results = rasterizer(
+            means3D=gaussian_means[i],
+            means2D=mean_gradients,
+            shs=shs[i] if use_sh else None,
+            colors_precomp=None if use_sh else shs[i, :, 0, :],
+            opacities=gaussian_opacities[i, ..., None],
+            cov3Ds_precomp=gaussian_covariances[i, :, row, col],
+            # scales=torch.Tensor([]),
+            # rotations=torch.Tensor([]),
+            extra_attrs=_feats3D,
+            norm3Ds_precomp = gaussian_means[i].clone(),  # dummy placeholder
+            # feats3D=_feats3D,
+        )
+        # image, feats, depth, alpha, radii = results
+        image, depth, norm, alpha, radii, feats = results  # the new one
+        all_feats.append(feats)
         all_images.append(image)
-        all_radii.append(radii)
         all_depth.append(depth)
     
     image_batch = torch.stack(all_images)
     depth_batch = torch.stack(all_depth)
+    feats_batch = torch.stack(all_feats)
+
+    return image_batch, depth_batch, feats_batch
     
-    if feats3D is None:
-        return image_batch, depth_batch
-    else:
-        feats_batch = torch.stack(all_feats)
-        return image_batch, depth_batch, feats_batch
+    # if feats3D is None:
+    #     return image_batch, depth_batch
+    # else:
+    #     feats_batch = torch.stack(all_feats)
+    #     return image_batch, depth_batch, feats_batch
 
 
 def render_cuda_orthographic(
@@ -172,7 +170,7 @@ def render_cuda_orthographic(
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
 
     _, _, _, n = gaussian_sh_coefficients.shape
-    degree = isqrt(n) - 1
+    degree = math.floor(math.sqrt(n)) - 1
     shs = rearrange(gaussian_sh_coefficients, "b g xyz n -> b g n xyz").contiguous()
 
     # Create fake "orthographic" projection by moving the camera back and picking a

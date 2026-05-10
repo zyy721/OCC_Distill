@@ -8,6 +8,8 @@ from .loading import (LoadAnnotations3D, LoadAnnotationsBEVDepth,
                       LoadPointsFromMultiSweeps, NormalizePointsColor,
                       PointSegClassMapping, PointToMultiViewDepth,
                       PrepareImageInputs, LoadOccGTFromFile, PointToEgo)
+from .loading_3d import PrepareImageInputsForVisionPAD
+
 from .nuplan_loading import (LoadNuPlanPointsFromFile, LoadNuPlanPointsFromMultiSweeps,
                              OpenScenePointToMultiViewDepth)
 
@@ -40,5 +42,5 @@ __all__ = [
     'LoadAnnotationsBEVDepth', 'PointToMultiViewDepth',
     'LoadOccGTFromFile', 'PointToEgo', 'PointsConditionalFlip',
     'PointsOCCAugmentation', 'LoadNuPlanPointsFromFile', 'LoadNuPlanPointsFromMultiSweeps',
-    'OpenScenePointToMultiViewDepth'
+    'OpenScenePointToMultiViewDepth', 'PrepareImageInputsForVisionPAD'
 ]

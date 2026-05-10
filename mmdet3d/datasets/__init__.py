@@ -11,7 +11,7 @@ from .nuscenes_mono_dataset import NuScenesMonoDataset
 from .nuscenes_dataset_occ import NuScenesDatasetOccpancy
 from .robodrive_dataset import RoboDriveDataset
 from .nuscenes_dataset_occ_binary import NuScenesDatasetBinaryOccpancy
-from .nuscenes_dataset_occ_pretrain import NuScenesDatasetOccPretrain
+from .nuscenes_dataset_occ_pretrain import NuScenesDatasetOccPretrain, NuScenesDatasetOccVisionPAD
 from .nuscenes_dataset_segmentation import NuScenesDatasetOccpancySegmentation
 # yapf: disable
 from .pipelines import (AffineResize, BackgroundPointsFilter, GlobalAlignment,
@@ -53,5 +53,6 @@ __all__ = [
     'RangeLimitedRandomCrop', 'RandomRotate', 'MultiViewWrapper',
     'NuScenesDatasetOccpancy', 'NuScenesDatasetOccpancySegmentation',
     'NuScenesDatasetBinaryOccpancy', 'NuScenesDatasetOccPretrain',
+    'NuScenesDatasetOccVisionPAD',
     'RoboDriveDataset', 'CustomNuPlanDataset', 'NuScenesOpenOccDataset'
 ]

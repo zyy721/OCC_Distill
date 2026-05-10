@@ -13,6 +13,7 @@ from copy import deepcopy
 import os.path as osp
 import pickle
 from einops import rearrange, repeat
+from pyquaternion import Quaternion
 from mmcv.parallel import collate
 from .builder import DATASETS
 from .nuscenes_dataset_occ import NuScenesDatasetOccpancy
@@ -29,6 +30,158 @@ def visualize_instance_image(instance_mask):
         color = np.concatenate([np.random.random(3), [0.7]]) * 255
         instance_img[instance_mask == id] = color
     return instance_img
+
+
+def rt2mat(translation, quaternion=None, inverse=False, rotation=None):
+    R = Quaternion(quaternion).rotation_matrix if rotation is None else rotation
+    T = np.array(translation)
+    if inverse:
+        R = R.T
+        T = -R @ T
+    mat = np.eye(4)
+    mat[:3, :3] = R
+    mat[:3, 3] = T
+    return mat
+
+
+def load_adjacent_info(input_dict, extra_frames):
+    curr_cam_to_ego = np.stack(input_dict['cam2camego'])  # (6, 4, 4)
+    curr_camego_to_global = np.stack(input_dict['camego2global'])  # (6, 4, 4)
+
+    camera_types = [
+        'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT',
+        'CAM_BACK', 'CAM_BACK_RIGHT'
+    ]
+    
+    output_dict = {}
+    cam_intrinsic = np.stack(input_dict['cam_intrinsic'])
+    output_dict['K'] = torch.from_numpy(cam_intrinsic).to(torch.float32)  # (6, 4, 4)
+    
+    seq_cam_to_cam_list = []
+    info_adj_list = []
+    for idx in extra_frames:
+        if idx == -1:
+            flag = 'prev'
+        elif idx == 1:
+            flag = 'next'
+        
+        adj_info = input_dict[flag]
+
+        if len(adj_info['CAM_FRONT']) == 0:
+            adj_info = input_dict['cams']
+        
+        info_adj_list.append({'cams': adj_info})
+
+        adj_global_to_ego_list,  adj_ego_to_cam_list = [], []
+        for cam_type in camera_types:
+            cam_info = adj_info[cam_type]
+            
+            cam_to_ego = rt2mat(cam_info['sensor2ego_translation'],
+                                cam_info['sensor2ego_rotation'])
+            ego_to_cam = np.linalg.inv(cam_to_ego)
+            
+            ego_to_global = rt2mat(cam_info['ego2global_translation'],
+                                    cam_info['ego2global_rotation'])
+            global_to_ego = np.linalg.inv(ego_to_global)
+
+            adj_global_to_ego_list.append(global_to_ego)
+            adj_ego_to_cam_list.append(ego_to_cam)
+        
+        adj_global_to_ego = np.stack(adj_global_to_ego_list)
+        adj_ego_to_cam = np.stack(adj_ego_to_cam_list)
+
+        curr_cam_to_cami = adj_ego_to_cam @ adj_global_to_ego @ curr_camego_to_global @ curr_cam_to_ego
+        seq_cam_to_cam_list.append(curr_cam_to_cami)
+    
+    cam_T_cam = np.stack(seq_cam_to_cam_list)
+    output_dict['cam_T_cam'] = torch.from_numpy(cam_T_cam).to(torch.float32)  # (2, 6, 4, 4)
+    output_dict['adjacent'] = info_adj_list
+    return output_dict
+
+
+@DATASETS.register_module()
+class NuScenesDatasetOccVisionPAD(NuScenesDatasetOccpancy):
+    def __init__(self,
+                 use_depth_consistency=False,
+                 extra_frames=[-1, 1],
+                 future_frames=[1],
+                 adjacent_frames=None,
+                 use_flow_photometric_loss=False,
+                 **kwargs):
+        super().__init__(**kwargs)
+        
+        self.future_frames = future_frames
+        assert len(self.future_frames) == 1, 'Currently we only support one future key frames.'
+
+        self.adjacent_frames = adjacent_frames
+        if self.adjacent_frames is not None:
+            self.future_frames = self.adjacent_frames
+
+        self.use_depth_consistency = use_depth_consistency
+        self.extra_frames = extra_frames
+        self.use_flow_photometric_loss = use_flow_photometric_loss
+
+    def get_data_info(self, index):
+        input_dict = super().get_data_info(index)
+
+        curr_info = self.data_infos[index]
+        # NOTE: here the  lidar is ego actually
+        input_dict['lidar2img'] = np.stack(curr_info['lidar2img'])
+        input_dict['lidar2cam'] = np.stack(curr_info['lidar2cam'])
+        input_dict['cam_intrinsic'] = curr_info['cam_intrinsic']
+        input_dict['cam2camego'] = curr_info['cam2camego']
+        input_dict['camego2global'] = curr_info['camego2global']
+        input_dict['prev'] = curr_info['prev']
+        input_dict['next'] = curr_info['next']
+        input_dict['cams'] = curr_info['cams']
+
+        # obtain the current ego to global transformation
+        curr_ego_to_global = rt2mat(input_dict['curr']['ego2global_translation'],
+                                    input_dict['curr']['ego2global_rotation'])
+        
+        for idx in self.future_frames:
+            adj_idx = index + idx
+            select_id = max(min(adj_idx, len(self) - 1), 0)
+            adj_info = self.data_infos[select_id]
+            curr_info = self.data_infos[index]
+            if adj_info['scene_token'] != curr_info['scene_token']:
+                adj_info = curr_info
+
+            # obtain the current ego to future ego transformation
+            adj_global2ego = rt2mat(adj_info['ego2global_translation'],
+                                    adj_info['ego2global_rotation'],
+                                    inverse=True)
+            # (4, 4) matrix
+            curr_ego_to_adj_ego = adj_global2ego @ curr_ego_to_global
+
+            future_pose_spatial = np.stack(adj_info['lidar2cam'])  # (6, 4, 4)
+            future_cam_intrinsic = np.stack(adj_info['cam_intrinsic'])  # (6, 4, 4)
+
+            if idx == -1:
+                flag = 'prev'
+            else:
+                flag = 'future'
+            
+            input_dict[f'pose_spatial_{flag}'] = torch.from_numpy(future_pose_spatial).to(torch.float32)  # (6, 4, 4)
+            input_dict[f'cam_intrinsic_{flag}'] = torch.from_numpy(future_cam_intrinsic).to(torch.float32)
+            input_dict[f'curr_lidar_T_{flag}_lidar'] = torch.from_numpy(curr_ego_to_adj_ego)[None].to(torch.float32)
+            input_dict[f'{flag}_info'] = adj_info
+
+            if self.use_flow_photometric_loss:
+                # load the adjacent information for the flow-based self-supervised learning
+                future_adj_dict = load_adjacent_info(adj_info, self.extra_frames)
+                ## add the "_future" suffix to the key
+                future_adj_dict = {f'{key}_{flag}': value for key, value in future_adj_dict.items()}
+                input_dict.update(future_adj_dict)
+
+        if self.use_depth_consistency:
+            curr_adj_dict = load_adjacent_info(input_dict, self.extra_frames)
+            ## add the "_visionpad" suffix to the key
+            # curr_adj_dict = {f'{key}_{"visionpad"}': value for key, value in curr_adj_dict.items()}
+            curr_adj_dict['adjacent_visionpad'] = curr_adj_dict.pop('adjacent')
+            input_dict.update(curr_adj_dict)
+        
+        return input_dict
 
 
 @DATASETS.register_module()

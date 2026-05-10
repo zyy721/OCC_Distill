@@ -279,6 +279,17 @@ class GaussianSplattingDecoder(NeRFDecoderHead):
                                         volume_feat=None,
                                         render_mask=None,
                                         vis_semantic=False):
+        if vis_semantic:
+            with torch.no_grad():
+                depth, color, feats = self.visualize_gaussian(
+                    density_prob,
+                    rgb_recon,
+                    semantic_pred,
+                    intrinsics,
+                    extrinsics,
+                )
+                return depth, color, feats
+        
         b, v = intrinsics.shape[:2]
         device = density_prob.device
         
@@ -332,6 +343,84 @@ class GaussianSplattingDecoder(NeRFDecoderHead):
 
         return depth, color, feats
     
+    def visualize_gaussian(self,
+                           density_prob, 
+                           rgb_recon, 
+                           semantic_pred, 
+                           intrinsics, 
+                           extrinsics):
+        b, v = intrinsics.shape[:2]
+        device = density_prob.device
+        
+        near = torch.ones(b, v).to(device) * self.min_depth
+        far = torch.ones(b, v).to(device) * self.max_depth
+        background_color = torch.zeros((3), dtype=torch.float32).to(device)
+        
+        intrinsics = intrinsics[..., :3, :3]
+        # normalize the intrinsics
+        intrinsics[..., 0, :] /= self.render_w
+        intrinsics[..., 1, :] /= self.render_h
+
+        transform = torch.Tensor([[0, 1, 0, 0],
+                                  [1, 0, 0, 0],
+                                  [0, 0, 1, 0],
+                                  [0, 0, 0, 1]]).to(device)
+        extrinsics = transform.unsqueeze(0).unsqueeze(0) @ extrinsics
+        
+        bs = density_prob.shape[0]
+        xyzs = repeat(self.volume_xyz, 'h w d dim3 -> bs h w d dim3', bs=bs)
+        xyzs = rearrange(xyzs, 'b h w d dim3 -> b (h w d) dim3') # (bs, num, 3)
+
+        density_prob = rearrange(density_prob, 'b dim1 h w d -> (b dim1) (h w d)')
+
+        if self.semantic_head:
+            semantic_pred = rearrange(semantic_pred, 'b c h w d -> b (h w d) c')
+
+        harmonics = rearrange(rgb_recon, 'b dim3 h w d -> b (h w d) dim3 ()')
+        g = xyzs.shape[1]
+
+        gaussians = Gaussians
+        gaussians.means = xyzs  ######## Gaussian center ########
+        gaussians.opacities = torch.sigmoid(density_prob) ######## Gaussian opacities ########
+
+        scales = torch.ones(3).unsqueeze(0).to(device) * 0.2
+        rotations = torch.Tensor([1, 0, 0, 0]).unsqueeze(0).to(device)
+
+        # Create world-space covariance matrices.
+        covariances = build_covariance(scales, rotations)
+        c2w_rotations = extrinsics[..., :3, :3]
+        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+        gaussians.covariances = covariances ######## Gaussian covariances ########
+
+        gaussians.harmonics = harmonics ######## Gaussian harmonics ########
+
+        render_results = render_cuda(
+            rearrange(extrinsics, "b v i j -> (b v) i j"),
+            rearrange(intrinsics, "b v i j -> (b v) i j"),
+            rearrange(near, "b v -> (b v)"),
+            rearrange(far, "b v -> (b v)"),
+            (self.render_h, self.render_w),
+            repeat(background_color, "c -> (b v) c", b=b, v=v),
+            repeat(gaussians.means, "b g xyz -> (b v) g xyz", v=v),
+            repeat(gaussians.covariances, "b v i j -> (b v) g i j", g=g),
+            repeat(gaussians.harmonics, "b g c d_sh -> (b v) g c d_sh", v=v),
+            repeat(gaussians.opacities, "b g -> (b v) g", v=v),
+            scale_invariant=False,
+            use_sh=False,
+            feats3D=repeat(semantic_pred, "b g c -> (b v) g c", v=v)
+        )
+        if self.semantic_head:
+            color, depth, feats = render_results
+            feats = rearrange(feats, "(b v) c h w -> b v c h w", b=b, v=v)
+        else:
+            color, depth = render_results
+            feats = None
+        
+        color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
+        depth = rearrange(depth, "(b v) c h w -> b v c h w", b=b, v=v).squeeze(2)
+
+        return depth, color, feats
+
     def predict_gaussian(self,
                          density_prob,
                          extrinsics,
