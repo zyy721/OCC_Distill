@@ -43,11 +43,18 @@ data_config = {
     'render_size': (360, 640),
 
     # Augmentation
-    'resize': (-0.06, 0.11),
-    'rot': (-5.4, 5.4),
-    'flip': True,
-    'crop_h': (0.0, 0.0),
-    'resize_test': 0.00,
+    # 'resize': (-0.06, 0.11),
+    # 'rot': (-5.4, 5.4),
+    # 'flip': True,
+    # 'crop_h': (0.0, 0.0),
+    # 'resize_test': 0.00,
+
+    'resize': (0.0, 0.0),      # 设置为 0，不进行随机缩放
+    'rot': (0.0, 0.0),         # 设置为 0，不进行随机旋转
+    'flip': False,             # 关闭随机翻转
+    'crop_h': (0.0, 0.0),      # 不进行裁剪
+    'resize_test': 0.00,       # 测试时不缩放
+    
 }
 
 # Model
@@ -197,7 +204,7 @@ train_pipeline = [
         is_train=True,
         data_config=data_config,
         sequential=True),
-    # dict(type='LoadOccGTFromFile'),
+    dict(type='LoadOccGTFromFile'),
     dict(
         type='LoadAnnotationsBEVDepth',
         bda_aug_conf=bda_aug_conf,
@@ -276,7 +283,10 @@ share_data_config = dict(
 
 test_data_config = dict(
     pipeline=test_pipeline,
-    ann_file=data_root + 'bevdetv2-nuscenes_infos_val_visionpad.pkl')
+    # ann_file=data_root + 'bevdetv2-nuscenes_infos_val_visionpad.pkl')
+    # ann_file=data_root + 'nuscenes_unified_infos_val_v4.pkl')
+    # ann_file=data_root + 'nuscenes_unified_infos_val_v4_ann_infos.pkl')
+    ann_file=data_root + 'nuscenes_unified_infos_val_v4_ann_infos_ego.pkl')
 
 data = dict(
     samples_per_gpu=2,
@@ -286,7 +296,11 @@ data = dict(
         use_flow_photometric_loss=use_flow_photometric_loss,
         future_frames=[1],
         data_root=data_root,
-        ann_file=data_root + 'bevdetv2-nuscenes_infos_train_visionpad.pkl',
+        # ann_file=data_root + 'bevdetv2-nuscenes_infos_train_visionpad.pkl',
+        # ann_file=data_root + 'nuscenes_unified_infos_train_v4.pkl',
+        # ann_file=data_root + 'nuscenes_unified_infos_train_v4_ann_infos.pkl',
+        ann_file=data_root + 'nuscenes_unified_infos_train_v4_ann_infos_ego.pkl',
+
         pipeline=train_pipeline,
         classes=class_names,
         test_mode=False,
@@ -319,5 +333,5 @@ runner = dict(type='EpochBasedRunner', max_epochs=12)
 #     ),
 # ]
 
-load_from="ckpts/bevdet-r50-4dlongterm-stereo-cbgs.pth"
+# load_from="ckpts/bevdet-r50-4dlongterm-stereo-cbgs.pth"
 # fp16 = dict(loss_scale='dynamic')

@@ -59,6 +59,11 @@ class NuScenesDatasetOccpancy(NuScenesDataset):
         # standard protocol modified from SECOND.Pytorch
         if 'occ_path' in self.data_infos[index].keys():
             input_dict['occ_gt_path'] = self.data_infos[index]['occ_path']
+
+        # custom
+        if 'occ_gt_path' in self.data_infos[index].keys():
+            input_dict['occ_gt_path'] = self.data_infos[index]['occ_gt_path']
+
         ## add the lidarseg info
         if 'lidarseg' in self.data_infos[index].keys():
             input_dict['lidarseg'] = self.data_infos[index]['lidarseg']

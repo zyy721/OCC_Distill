@@ -94,6 +94,11 @@ class PrepareImageInputsForVisionPAD(PrepareImageInputsForNeRF):
                        img_size=None,  # (h, w)
                        to_rgb=True):
         ## we need [0, 1] images in RGB order
+        # try:
+        #     img = img.resize(img_size[::-1], resample=None)
+        # except (TypeError, ImportError):
+        #     img = img.resize(img_size[::-1])
+
         img = img.resize(img_size[::-1], resample=None)
         img = imnormalize(np.array(img), self.mean, self.std, to_rgb)
         return img

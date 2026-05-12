@@ -19,7 +19,13 @@ from ..builder import PIPELINES
 class LoadOccGTFromFile(object):
     def __call__(self, results):
         occ_gt_path = results['occ_gt_path']
-        occ_gt_path = os.path.join(occ_gt_path, "labels.npz")
+
+        if "data/nuscenes" not in occ_gt_path:
+            occ_gt_path = os.path.join("data/nuscenes", occ_gt_path)
+            results['scene_number'] = int(occ_gt_path.split('/')[3][-4:])
+        else:
+            occ_gt_path = os.path.join(occ_gt_path, "labels.npz")
+            results['scene_number'] = int(occ_gt_path.split('/')[4][-4:])
 
         occ_labels = np.load(occ_gt_path)
         semantics = occ_labels['semantics']
@@ -30,7 +36,7 @@ class LoadOccGTFromFile(object):
         results['mask_lidar'] = mask_lidar
         results['mask_camera'] = mask_camera
 
-        results['scene_number'] = int(occ_gt_path.split('/')[4][-4:])
+        # results['scene_number'] = int(occ_gt_path.split('/')[4][-4:])
 
         ## get the free_voxels which are not occupied by any object
         free_voxels = (semantics == 17)
@@ -1913,7 +1919,9 @@ class PrepareImageInputsForNeRF(object):
                                    flip=img_non_aug[3],
                                    rotate=img_non_aug[4])
 
-            target_imgs.append(mmlab_wo_normalize(img_wo_aug))
+            # target_imgs.append(mmlab_wo_normalize(img_wo_aug))
+            target_imgs.append(img_wo_aug)
+
             target_post_rot = torch.eye(3)
             targt_post_tran = torch.zeros(3)
             target_post_rot[:2, :2] = post_rot2_wo_aug
@@ -1978,7 +1986,7 @@ class PrepareImageInputsForNeRF(object):
 
         imgs = torch.stack(imgs)
         render_img_gts = torch.stack(render_img_gts)
-        target_imgs = torch.stack(target_imgs)
+        # target_imgs = torch.stack(target_imgs)
         sensor2egos = torch.stack(sensor2egos)
         ego2globals = torch.stack(ego2globals)
         intrins = torch.stack(intrins)

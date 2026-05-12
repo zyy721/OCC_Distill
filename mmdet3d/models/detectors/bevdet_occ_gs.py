@@ -309,7 +309,8 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
         uni_feats = self.uni_conv(img_feats[0])  # (bs, c, z, y, x)
 
         output = dict()
-        output['pose_spatial'] = torch.inverse(kwargs['lidar2cam'])
+        # output['pose_spatial'] = torch.inverse(kwargs['lidar2cam'])
+        output['pose_spatial'] = torch.inverse(kwargs['lidar2cam'].float())
         output['intrinsics'] = kwargs['cam_intrinsic'].float()  # (bs, 6, 4, 4)
 
         ## 2. Prepare the features for rendering

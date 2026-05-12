@@ -215,14 +215,17 @@ share_data_config = dict(
 
 test_data_config = dict(
     pipeline=test_pipeline,
-    ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')
+    ann_file=data_root + 'bevdetv2-nuscenes_infos_val_occ.pkl')
+    # ann_file=data_root + 'occ_infos_temporal_val.pkl')
 
 data = dict(
     samples_per_gpu=4,
     workers_per_gpu=4,
     train=dict(
         data_root=data_root,
-        ann_file=data_root + 'bevdetv2-nuscenes_infos_train.pkl',
+        ann_file=data_root + 'bevdetv2-nuscenes_infos_train_occ.pkl',
+        # ann_file=data_root + 'occ_infos_temporal_train.pkl',
+
         pipeline=train_pipeline,
         classes=class_names,
         test_mode=False,
@@ -264,5 +267,5 @@ custom_hooks = [
     ),
 ]
 
-load_from="work_dirs/visionpad_bevdet-occ-r50-4dlongterm-stereo-24e_384704/epoch_9.pth"
+# load_from="work_dirs/visionpad_bevdet-occ-r50-4dlongterm-stereo-24e_384704/epoch_9.pth"
 # fp16 = dict(loss_scale='dynamic')
