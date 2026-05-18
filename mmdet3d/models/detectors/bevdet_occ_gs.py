@@ -148,6 +148,9 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
         BEVStereo4DOCC (_type_): _description_
     """
     def __init__(self,
+                 is_pretrain_det=False,
+                 in_dim=32,
+
                  render_scale=(1, 1),
                  use_semantic=False,
                  render_head_cfg=None,
@@ -175,6 +178,9 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
                  **kwargs):
         super(BEVStereo4DOCCVisionPAD, self).__init__(**kwargs)
         
+        self.is_pretrain_det = is_pretrain_det
+        self.in_dim = in_dim
+
         self.use_semantic = use_semantic
 
         self.pred_flow = pred_flow
@@ -226,7 +232,9 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
 
         self.uni_conv = nn.Sequential(
             nn.Conv3d(
-                self.out_dim,
+                # self.out_dim,
+                self.in_dim,
+
                 self.out_dim,
                 kernel_size=3,
                 padding=1,
@@ -306,7 +314,10 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
         loss_depth = self.img_view_transformer.get_depth_loss(gt_depth, depth)
         losses['loss_depth'] = loss_depth
 
-        uni_feats = self.uni_conv(img_feats[0])  # (bs, c, z, y, x)
+        if self.is_pretrain_det:
+            img_feats[0] = rearrange(img_feats[0], 'B (Z C) Y X -> B C Z Y X', Z=self.voxel_shape[2], C=self.in_dim)
+
+        uni_feats = self.uni_conv(img_feats[0])  # (bs, c, z, y, x)     torch.Size([4, 256, 128, 128])
 
         output = dict()
         # output['pose_spatial'] = torch.inverse(kwargs['lidar2cam'])

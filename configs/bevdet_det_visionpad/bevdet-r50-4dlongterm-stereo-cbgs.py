@@ -1,29 +1,59 @@
 # Copyright (c) Phigent Robotics. All rights reserved.
+# align_after_view_transfromation=True
+# mAP: 0.4110
+# mATE: 0.5763
+# mASE: 0.2845
+# mAOE: 0.4682
+# mAVE: 0.3027
+# mAAE: 0.1950
+# NDS: 0.5228
+# Eval time: 131.4s
+#
+# Per-class results:
+# Object Class	AP	ATE	ASE	AOE	AVE	AAE
+# car	0.624	0.392	0.155	0.073	0.248	0.185
+# truck	0.342	0.530	0.200	0.087	0.225	0.185
+# bus	0.365	0.674	0.205	0.074	0.698	0.330
+# trailer	0.223	0.925	0.268	0.489	0.172	0.123
+# construction_vehicle	0.130	0.925	0.519	1.184	0.110	0.315
+# pedestrian	0.477	0.618	0.303	0.630	0.338	0.186
+# motorcycle	0.410	0.551	0.267	0.594	0.468	0.231
+# bicycle	0.338	0.428	0.274	0.958	0.161	0.006
+# traffic_cone	0.608	0.351	0.350	nan	nan	nan
+# barrier	0.593	0.369	0.305	0.124	nan	nan
 
-# 2x/e24
-# ===> per class IoU of 6019 samples:
-# ===> others - IoU = 9.33
-# ===> barrier - IoU = 47.05
-# ===> bicycle - IoU = 19.23
-# ===> bus - IoU = 41.47
-# ===> car - IoU = 52.21
-# ===> construction_vehicle - IoU = 27.19
-# ===> motorcycle - IoU = 21.23
-# ===> pedestrian - IoU = 23.32
-# ===> traffic_cone - IoU = 21.58
-# ===> trailer - IoU = 35.77
-# ===> truck - IoU = 38.94
-# ===> driveable_surface - IoU = 82.48
-# ===> other_flat - IoU = 40.42
-# ===> sidewalk - IoU = 53.75
-# ===> terrain - IoU = 57.71
-# ===> manmade - IoU = 49.94
-# ===> vegetation - IoU = 45.76
-# ===> mIoU of 6019 samples: 39.26
+
+# align_after_view_transfromation=False
+# mAP: 0.4149
+# mATE: 0.5655
+# mASE: 0.2842
+# mAOE: 0.4647
+# mAVE: 0.2979
+# mAAE: 0.1949
+# NDS: 0.5268
+# Eval time: 129.4s
+#
+# Per-class results:
+# Object Class	AP	ATE	ASE	AOE	AVE	AAE
+# car	0.628	0.387	0.154	0.073	0.245	0.185
+# truck	0.343	0.523	0.199	0.087	0.223	0.186
+# bus	0.363	0.671	0.205	0.082	0.694	0.326
+# trailer	0.225	0.914	0.266	0.478	0.167	0.122
+# construction_vehicle	0.134	0.915	0.516	1.180	0.111	0.327
+# pedestrian	0.483	0.611	0.303	0.629	0.336	0.185
+# motorcycle	0.418	0.526	0.270	0.578	0.449	0.223
+# bicycle	0.342	0.410	0.275	0.954	0.158	0.005
+# traffic_cone	0.613	0.340	0.350	nan	nan	nan
+# barrier	0.600	0.358	0.305	0.121	nan	nan
+
+
 
 
 _base_ = ['../_base_/datasets/nus-3d.py', '../_base_/default_runtime.py']
 # Global
+# If point cloud range is changed, the models should also change their point
+# cloud range accordingly
+# point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 # For nuScenes we usually do 10-class detection
 class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
@@ -37,7 +67,7 @@ data_config = {
     ],
     'Ncams':
     6,
-    'input_size': (384, 704),
+    'input_size': (256, 704),
     'src_size': (900, 1600),
 
     'render_size': (360, 640),
@@ -54,29 +84,31 @@ data_config = {
     'flip': False,             # 关闭随机翻转
     'crop_h': (0.0, 0.0),      # 不进行裁剪
     'resize_test': 0.00,       # 测试时不缩放
-    
+
 }
 
 # Model
 grid_config = {
-    'x': [-40, 40, 0.4],
-    'y': [-40, 40, 0.4],
-    'z': [-1, 5.4, 0.4],
-    'depth': [1.0, 45.0, 0.5],
+    'x': [-51.2, 51.2, 0.8],
+    'y': [-51.2, 51.2, 0.8],
+    'z': [-5, 3, 8],
+    'depth': [1.0, 60.0, 1.0],
 }
 
 voxel_size = [0.1, 0.1, 0.2]
 
-numC_Trans = 32
+numC_Trans = 80
 
 multi_adj_frame_id_cfg = (1, 8+1, 1)
 
 _render_scale = [data_config['render_size'][0]/data_config['src_size'][0],
                 data_config['render_size'][1]/data_config['src_size'][1]]
 
-point_cloud_range = [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
-unified_voxel_shape = [200, 200, 16]
-unified_voxel_size = [0.4, 0.4, 0.4]
+point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+# unified_voxel_shape = [128, 128, 5]
+# unified_voxel_size = [0.8, 0.8, 1.6]
+unified_voxel_shape = [128, 128, 4]
+unified_voxel_size = [0.8, 0.8, 2]
 
 depth_ssl_size = (360, 640)
 
@@ -85,10 +117,15 @@ use_flow_photometric_loss = True
 _use_depth_consistency = True
 
 model = dict(
+    # type='BEVStereo4D',
     type='BEVStereo4DOCCVisionPAD',
+
+    is_pretrain_det=True,
+    in_dim=64,
+
     align_after_view_transfromation=False,
     num_adj=len(range(*multi_adj_frame_id_cfg)),
-    
+
     # for 3DGS
     render_scale=_render_scale,
     depth_ssl_size=depth_ssl_size,  # the image size for image warping in depth SSL
@@ -110,9 +147,8 @@ model = dict(
         disable_automasking=False,
         disparity_smoothness=0.001,
     ),
-
     img_backbone=dict(
-        # pretrained='torchvision://resnet50',
+        pretrained='torchvision://resnet50',
         type='ResNet',
         depth=50,
         num_stages=4,
@@ -135,31 +171,24 @@ model = dict(
         input_size=data_config['input_size'],
         in_channels=256,
         out_channels=numC_Trans,
-        sid=False,
-        collapse_z=False,
-        loss_depth_weight=0.05,
+        sid=True,
         depthnet_cfg=dict(use_dcn=False,
-                          with_cp=True,
                           aspp_mid_channels=96,
                           stereo=True,
                           bias=5.),
         downsample=16),
     img_bev_encoder_backbone=dict(
-        type='CustomResNet3D',
+        type='CustomResNet',
         numC_input=numC_Trans * (len(range(*multi_adj_frame_id_cfg))+1),
-        num_layer=[1, 2, 4],
-        with_cp=True,
-        num_channels=[numC_Trans,numC_Trans*2,numC_Trans*4],
-        stride=[1,2,2],
-        backbone_output_ids=[0,1,2]),
-    img_bev_encoder_neck=dict(type='LSSFPN3D',
-                              in_channels=numC_Trans*7,
-                              out_channels=numC_Trans),
+        num_channels=[numC_Trans * 2, numC_Trans * 4, numC_Trans * 8]),
+    img_bev_encoder_neck=dict(
+        type='FPN_LSS',
+        in_channels=numC_Trans * 8 + numC_Trans * 2,
+        out_channels=256),
     pre_process=dict(
-        type='CustomResNet3D',
+        type='CustomResNet',
         numC_input=numC_Trans,
-        with_cp=True,
-        num_layer=[1,],
+        num_layer=[2,],
         num_channels=[numC_Trans,],
         stride=[1,],
         backbone_output_ids=[0,]),
@@ -179,7 +208,7 @@ model = dict(
         gs_scale_min=0.1,
         gs_scale_max=0.5,
     ),
-    
+
     loss_occ=dict(
         type='CrossEntropyLoss',
         use_sigmoid=False,
@@ -188,11 +217,14 @@ model = dict(
 )
 
 # Data
+# dataset_type = 'NuScenesDataset'
 dataset_type = 'NuScenesDatasetOccVisionPAD'
 data_root = 'data/nuscenes/'
 file_client_args = dict(backend='disk')
 
 bda_aug_conf = dict(
+    # rot_lim=(-22.5, 22.5),
+    # scale_lim=(0.95, 1.05),
     rot_lim=(-0., 0.),
     scale_lim=(1., 1.),
     flip_dx_ratio=0.5,
@@ -200,22 +232,24 @@ bda_aug_conf = dict(
 
 train_pipeline = [
     dict(
+        # type='PrepareImageInputs',
         type='PrepareImageInputsForNeRF',
         is_train=True,
         data_config=data_config,
         sequential=True),
-    dict(type='LoadOccGTFromFile'),
     dict(
         type='LoadAnnotationsBEVDepth',
         bda_aug_conf=bda_aug_conf,
-        classes=class_names,
-        is_train=True),
+        classes=class_names),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=5,
         use_dim=5,
         file_client_args=file_client_args),
+    # dict(type='PointToMultiViewDepth', downsample=1, grid_config=grid_config),
+    # dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    # dict(type='ObjectNameFilter', classes=class_names),
     dict(
         type='PointToMultiViewDepthForNeRF', 
         downsample=1, 
@@ -228,6 +262,9 @@ train_pipeline = [
         input_size=depth_ssl_size,
         render_size=data_config['render_size'],),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
+    # dict(
+    #     type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',
+    #                             'gt_depth'])
     dict(
         type='Collect3D', keys=['img_inputs', 'gt_depth', 
                                 'cam_intrinsic', 'lidar2cam',
@@ -283,14 +320,26 @@ share_data_config = dict(
 
 test_data_config = dict(
     pipeline=test_pipeline,
-    # ann_file=data_root + 'bevdetv2-nuscenes_infos_val_visionpad.pkl')
-    # ann_file=data_root + 'nuscenes_unified_infos_val_v4.pkl')
-    # ann_file=data_root + 'nuscenes_unified_infos_val_v4_ann_infos.pkl')
+    # ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')
     ann_file=data_root + 'nuscenes_unified_infos_val_v4_ann_infos_ego.pkl')
 
+
 data = dict(
+    # samples_per_gpu=4,
     samples_per_gpu=2,
     workers_per_gpu=4,
+    # train=dict(
+    #     type='CBGSDataset',
+    #     dataset=dict(
+    #     data_root=data_root,
+    #     ann_file=data_root + 'bevdetv2-nuscenes_infos_train.pkl',
+    #     pipeline=train_pipeline,
+    #     classes=class_names,
+    #     test_mode=False,
+    #     use_valid_flag=True,
+    #     # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
+    #     # and box_type_3d='Depth' in sunrgbd and scannet dataset.
+    #     box_type_3d='LiDAR')),
     train=dict(
         use_depth_consistency=_use_depth_consistency,
         use_flow_photometric_loss=use_flow_photometric_loss,
@@ -311,19 +360,27 @@ data = dict(
     val=test_data_config,
     test=test_data_config)
 
+# for key in ['val', 'test']:
+#     data[key].update(share_data_config)
+# data['train']['dataset'].update(share_data_config)
+
 for key in ['val', 'train', 'test']:
     data[key].update(share_data_config)
 
 # Optimizer
-optimizer = dict(type='AdamW', lr=1e-4, weight_decay=1e-2)
+optimizer = dict(type='AdamW', lr=2e-4, weight_decay=1e-2)
 optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
 lr_config = dict(
     policy='step',
     warmup='linear',
     warmup_iters=200,
     warmup_ratio=0.001,
+    # step=[20,])
     step=[12,])
+
+# runner = dict(type='EpochBasedRunner', max_epochs=20)
 runner = dict(type='EpochBasedRunner', max_epochs=12)
+
 
 # custom_hooks = [
 #     dict(
@@ -331,7 +388,22 @@ runner = dict(type='EpochBasedRunner', max_epochs=12)
 #         init_updates=10560,
 #         priority='NORMAL',
 #     ),
+#     dict(
+#         type='SequentialControlHook',
+#         temporal_start_epoch=2,
+#     ),
 # ]
 
-load_from="ckpts/bevdet-r50-4dlongterm-stereo-cbgs.pth"
+custom_hooks = [
+    # dict(
+    #     type='MEGVIIEMAHook',
+    #     init_updates=10560,
+    #     priority='NORMAL',
+    # ),
+    dict(
+        type='SequentialControlHook',
+        temporal_start_epoch=1,
+    ),
+]
+
 # fp16 = dict(loss_scale='dynamic')
