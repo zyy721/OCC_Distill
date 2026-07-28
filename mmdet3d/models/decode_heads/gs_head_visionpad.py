@@ -18,7 +18,10 @@ from einops import rearrange, repeat
 from mmdet3d.models.builder import HEADS
 from mmcv.runner.base_module import BaseModule
 # from mmdet3d.models.decode_heads.nerf_head import NeRFDecoderHead
-from .common.gaussians import build_covariance
+from .common.gaussians import (
+    broadcast_covariances_to_views,
+    build_covariance,
+)
 from .common.cuda_splatting import render_cuda, render_depth_cuda, render_depth_cuda2
 from .common.sh_rotation import rotate_sh
 # from .gs_utils import get_rays_of_a_view
@@ -81,16 +84,16 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
         self.xyz_min = torch.from_numpy(np.array(pc_range[:3]))  # (x_min, y_min, z_min)
         self.xyz_max = torch.from_numpy(np.array(pc_range[3:]))  # (x_max, y_max, z_max)
 
-        ## construct the volume grid
-        xs = torch.arange(
-            self.xyz_min[0], self.xyz_max[0],
-            (self.xyz_max[0] - self.xyz_min[0]) / volume_size[0])
-        ys = torch.arange(
-            self.xyz_min[1], self.xyz_max[1],
-            (self.xyz_max[1] - self.xyz_min[1]) / volume_size[1])
-        zs = torch.arange(
-            self.xyz_min[2], self.xyz_max[2],
-            (self.xyz_max[2] - self.xyz_min[2]) / volume_size[2])
+        # Place Gaussians at voxel centres.  Using the lower cell boundary
+        # introduces a systematic half-voxel offset from the BEV feature and
+        # from the align_corners=False grid used by temporal warping.
+        voxel_size = (self.xyz_max - self.xyz_min) / torch.tensor(volume_size)
+        xs = self.xyz_min[0] + (
+            torch.arange(volume_size[0]) + 0.5) * voxel_size[0]
+        ys = self.xyz_min[1] + (
+            torch.arange(volume_size[1]) + 0.5) * voxel_size[1]
+        zs = self.xyz_min[2] + (
+            torch.arange(volume_size[2]) + 0.5) * voxel_size[2]
         W, H, D = len(xs), len(ys), len(zs)
 
         xyzs = torch.stack([
@@ -187,7 +190,7 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
             return render_depth, render_rgb, render_semantic
         
         volume_feat = inputs['volume_feat']  # B, X, Y, Z, C
-        render_depth, render_rgb, render_semantic, gaussians = \
+        render_depth, render_rgb, render_semantic, render_alpha, gaussians = \
             self.train_gaussian_rasterization_v2(
                 density_prob,
                 None,
@@ -196,9 +199,15 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
                 pose_spatial,
                 volume_feat=volume_feat
         )
-        render_depth = render_depth.clamp(self.min_depth, self.max_depth)
+        render_depth_valid = (render_alpha >= 1e-7) & (render_depth > 0)
+        render_depth = torch.where(
+            render_depth_valid,
+            render_depth.clamp(self.min_depth, self.max_depth),
+            torch.zeros_like(render_depth),
+        )
 
         dec_output = {'render_depth' + suffix: render_depth,
+                      'render_alpha' + suffix: render_alpha,
                       'render_rgb' + suffix: render_rgb,
                       'render_semantic' + suffix: render_semantic}
         if return_gaussians:
@@ -228,11 +237,7 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
 
         # use the new extrinsics to compute the Gaussian covariances
         covariances = build_covariance(gaussians.scales, gaussians.rotations)
-        covariances = rearrange(covariances, "b g i j -> b () g i j")
-
-        c2w_rotations = extrinsics[..., :3, :3]
-        c2w_rotations = rearrange(c2w_rotations, "b v i j -> b v () i j")
-        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+        covariances = broadcast_covariances_to_views(covariances, v)
         gaussians.covariances = covariances  # (bs, v, g, i, j)
 
         # start rendering
@@ -249,10 +254,11 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
             repeat(gaussians.opacities, "b g -> (b v) g", v=v),
             scale_invariant=False,
             use_sh=True,
-            feats3D=gaussians.feats
+            feats3D=gaussians.feats,
+            return_alpha=True,
         )
         
-        color, depth, feats = render_results
+        color, depth, feats, alpha = render_results
         if self.semantic_head:
             feats = rearrange(feats, "(b v) c h w -> b v c h w", b=b, v=v)
         else:
@@ -260,10 +266,16 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
         
         color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
         depth = rearrange(depth, "(b v) c h w -> b v c h w", b=b, v=v).squeeze(2)
-        
-        depth = depth.clamp(self.min_depth, self.max_depth)
+        alpha = rearrange(alpha, "(b v) c h w -> b v c h w", b=b, v=v).squeeze(2)
+        depth_valid = (alpha >= 1e-7) & (depth > 0)
+        depth = torch.where(
+            depth_valid,
+            depth.clamp(self.min_depth, self.max_depth),
+            torch.zeros_like(depth),
+        )
 
         dec_output = {'render_depth' + suffix: depth,
+                      'render_alpha' + suffix: alpha,
                       'render_rgb' + suffix: color,
                       'render_semantic' + suffix: feats}
         return dec_output
@@ -324,8 +336,7 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
 
         # Create world-space covariance matrices.
         covariances = build_covariance(scales, rotations)
-        c2w_rotations = extrinsics[..., :3, :3]
-        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+        covariances = repeat(covariances, "() i j -> b v i j", b=b, v=v)
         gaussians.covariances = covariances ######## Gaussian covariances ########
 
         gaussians.harmonics = harmonics ######## Gaussian harmonics ########
@@ -425,11 +436,6 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
         
         gaussians.feats = _feats3D
 
-        if self.filter_opacities:
-            mask = (gaussians.opacities > 0.0)
-            # set the opacities to 0.0 if the opacities are less than 0.0
-            gaussians.opacities = gaussians.opacities * mask
-        
         # start rendering
         render_results = render_cuda(
             rearrange(extrinsics, "b v i j -> (b v) i j"),
@@ -444,10 +450,11 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
             repeat(gaussians.opacities, "b g -> (b v) g", v=v),
             scale_invariant=False,
             use_sh=True,
-            feats3D=gaussians.feats
+            feats3D=gaussians.feats,
+            return_alpha=True,
         )
         
-        color, depth, feats = render_results
+        color, depth, feats, alpha = render_results
         if self.semantic_head:
             feats = rearrange(feats, "(b v) c h w -> b v c h w", b=b, v=v)
         else:
@@ -455,8 +462,9 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
         
         color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
         depth = rearrange(depth, "(b v) c h w -> b v c h w", b=b, v=v).squeeze(2)
+        alpha = rearrange(alpha, "(b v) c h w -> b v c h w", b=b, v=v).squeeze(2)
 
-        return depth, color, feats, gaussians
+        return depth, color, feats, alpha, gaussians
     
 
     def visualize_gaussian(self,
@@ -498,8 +506,7 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
 
         # Create world-space covariance matrices.
         covariances = build_covariance(scales, rotations)
-        c2w_rotations = extrinsics[..., :3, :3]
-        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+        covariances = repeat(covariances, "() i j -> b v i j", b=b, v=v)
         gaussians.covariances = covariances ######## Gaussian covariances ########
 
         gaussians.harmonics = harmonics ######## Gaussian harmonics ########
@@ -560,11 +567,10 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
         # construct 3D Gaussians
         gaussians = Gaussians
         
-        if not self.filter_opacities:
-            opacities = torch.sigmoid(density_prob)
-        else:
-            opacities = torch.tanh(density_prob)  # to (-1, 1)
-        gaussians.opacities = opacities
+        # Opacity is a probability. A sigmoid keeps it in [0, 1] and preserves
+        # gradients for initially empty voxels; hard-zeroing negative tanh
+        # values creates a dead half-space.
+        gaussians.opacities = torch.sigmoid(density_prob)
 
         gaussians.means = xyzs + (xyz_offset.sigmoid() - 0.5) * self.offset_scale
 
@@ -591,11 +597,7 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
         
         # Create world-space covariance matrices.
         covariances = build_covariance(scales, rotations)
-        covariances = rearrange(covariances, "b g i j -> b () g i j")
-
-        c2w_rotations = extrinsics[..., :3, :3]
-        c2w_rotations = rearrange(c2w_rotations, "b v i j -> b v () i j")
-        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+        covariances = broadcast_covariances_to_views(covariances, v)
         gaussians.covariances = covariances  # (bs, v, g, i, j)
 
         # Apply sigmoid to get valid colors.
@@ -671,8 +673,7 @@ class GaussianSplattingDecoderVisionPad(BaseModule):
 
         # Create world-space covariance matrices.
         covariances = build_covariance(scales, rotations)
-        c2w_rotations = extrinsics[..., :3, :3]
-        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+        covariances = repeat(covariances, "() i j -> b v i j", b=b, v=v)
         gaussians.covariances = covariances ######## Gaussian covariances ########
 
         harmonics = harmonics.unsqueeze(-1).unsqueeze(0)

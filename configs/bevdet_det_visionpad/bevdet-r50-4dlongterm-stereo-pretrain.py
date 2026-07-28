@@ -1,4 +1,6 @@
 # Copyright (c) Phigent Robotics. All rights reserved.
+# Detection rendering pretraining uses the natural nuScenes sample
+# distribution; it is not wrapped by CBGSDataset.
 # align_after_view_transfromation=True
 # mAP: 0.4110
 # mATE: 0.5763
@@ -129,6 +131,10 @@ model = dict(
     # for 3DGS
     render_scale=_render_scale,
     depth_ssl_size=depth_ssl_size,  # the image size for image warping in depth SSL
+    depth_alpha_threshold=1e-3,
+    # A sparse prior avoids starting with roughly 50% opacity at every voxel.
+    density_init_prob=0.01,
+    density_init_std=1e-3,
     pred_flow=False,
     use_flow_ssl=False,
     use_flow_photometric_loss=use_flow_photometric_loss,  # whether to use photometric loss or GT depth loss for flow
@@ -195,7 +201,7 @@ model = dict(
     ## For 3DGS
     render_head_cfg=dict(
         type="GaussianSplattingDecoderVisionPad",
-        filter_opacities=True,
+        filter_opacities=False,
         semantic_head=use_semantic,
         render_size=data_config['render_size'],
         depth_range=[0.1, 64],
@@ -316,12 +322,15 @@ share_data_config = dict(
     filter_empty_gt=False,
     img_info_prototype='bevdet4d',
     multi_adj_frame_id_cfg=multi_adj_frame_id_cfg,
+    key_ego_camera='CAM_FRONT_LEFT',
+    require_keyego_metadata=True,
 )
 
 test_data_config = dict(
     pipeline=test_pipeline,
     # ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')
-    ann_file=data_root + 'nuscenes_unified_infos_val_v4_ann_infos_ego.pkl')
+    ann_file=(data_root
+              + 'nuscenes_unified_infos_val_v4_ann_infos_fl_keyego.pkl'))
 
 
 data = dict(
@@ -348,7 +357,8 @@ data = dict(
         # ann_file=data_root + 'bevdetv2-nuscenes_infos_train_visionpad.pkl',
         # ann_file=data_root + 'nuscenes_unified_infos_train_v4.pkl',
         # ann_file=data_root + 'nuscenes_unified_infos_train_v4_ann_infos.pkl',
-        ann_file=data_root + 'nuscenes_unified_infos_train_v4_ann_infos_ego.pkl',
+        ann_file=(data_root
+                  + 'nuscenes_unified_infos_train_v4_ann_infos_fl_keyego.pkl'),
 
         pipeline=train_pipeline,
         classes=class_names,

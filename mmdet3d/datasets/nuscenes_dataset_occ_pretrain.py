@@ -19,6 +19,16 @@ from .builder import DATASETS
 from .nuscenes_dataset_occ import NuScenesDatasetOccpancy
 
 
+VISIONPAD_CAMERA_ORDER = (
+    'CAM_FRONT_LEFT',
+    'CAM_FRONT',
+    'CAM_FRONT_RIGHT',
+    'CAM_BACK_LEFT',
+    'CAM_BACK',
+    'CAM_BACK_RIGHT',
+)
+
+
 def visualize_instance_image(instance_mask):
     instance_img = np.zeros((*instance_mask.shape, 4), dtype=np.uint8)
 
@@ -48,10 +58,7 @@ def load_adjacent_info(input_dict, extra_frames):
     curr_cam_to_ego = np.stack(input_dict['cam2camego'])  # (6, 4, 4)
     curr_camego_to_global = np.stack(input_dict['camego2global'])  # (6, 4, 4)
 
-    camera_types = [
-        'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT',
-        'CAM_BACK', 'CAM_BACK_RIGHT'
-    ]
+    camera_types = VISIONPAD_CAMERA_ORDER
     
     output_dict = {}
     cam_intrinsic = np.stack(input_dict['cam_intrinsic'])
@@ -107,6 +114,9 @@ class NuScenesDatasetOccVisionPAD(NuScenesDatasetOccpancy):
                  future_frames=[1],
                  adjacent_frames=None,
                  use_flow_photometric_loss=False,
+                 load_future_adjacent=None,
+                 key_ego_camera='CAM_FRONT_LEFT',
+                 require_keyego_metadata=False,
                  **kwargs):
         super().__init__(**kwargs)
         
@@ -120,12 +130,34 @@ class NuScenesDatasetOccVisionPAD(NuScenesDatasetOccpancy):
         self.use_depth_consistency = use_depth_consistency
         self.extra_frames = extra_frames
         self.use_flow_photometric_loss = use_flow_photometric_loss
+        self.load_future_adjacent = (
+            use_flow_photometric_loss
+            if load_future_adjacent is None else load_future_adjacent)
+        self.key_ego_camera = key_ego_camera
+        if require_keyego_metadata:
+            expected_order = list(VISIONPAD_CAMERA_ORDER)
+            stored_reference = self.metadata.get('visionpad_ego_reference')
+            stored_order = self.metadata.get('visionpad_camera_order')
+            if stored_reference != self.key_ego_camera:
+                raise ValueError(
+                    f'Expected pkl ego reference {self.key_ego_camera}, got '
+                    f'{stored_reference}. Regenerate it with '
+                    'create_infos_w_visionpad.py.')
+            if self.key_ego_camera != expected_order[0]:
+                raise ValueError(
+                    f'VisionPAD expects {expected_order[0]} as key ego, got '
+                    f'{self.key_ego_camera}')
+            if stored_order != expected_order:
+                raise ValueError(
+                    f'Expected pkl camera order {expected_order}, got '
+                    f'{stored_order}. Regenerate it with '
+                    'create_infos_w_visionpad.py.')
 
     def get_data_info(self, index):
         input_dict = super().get_data_info(index)
 
         curr_info = self.data_infos[index]
-        # NOTE: here the  lidar is ego actually
+        # Legacy field names; the regenerated pkl stores key-ego-to-camera.
         input_dict['lidar2img'] = np.stack(curr_info['lidar2img'])
         input_dict['lidar2cam'] = np.stack(curr_info['lidar2cam'])
         input_dict['cam_intrinsic'] = curr_info['cam_intrinsic']
@@ -135,9 +167,20 @@ class NuScenesDatasetOccVisionPAD(NuScenesDatasetOccpancy):
         input_dict['next'] = curr_info['next']
         input_dict['cams'] = curr_info['cams']
 
-        # obtain the current ego to global transformation
-        curr_ego_to_global = rt2mat(input_dict['curr']['ego2global_translation'],
-                                    input_dict['curr']['ego2global_rotation'])
+        stored_cam_names = curr_info.get('cam_names')
+        if (stored_cam_names is not None and
+                list(stored_cam_names) != list(VISIONPAD_CAMERA_ORDER)):
+            raise ValueError(
+                f"Invalid camera order for sample {curr_info['token']}: "
+                f'{stored_cam_names}')
+
+        # BEVDet uses the first current-frame camera as key ego.  With the
+        # VisionPAD camera order this is CAM_FRONT_LEFT, so temporal flow must
+        # use that camera sample-data timestamp rather than LIDAR_TOP time.
+        curr_key_cam = curr_info['cams'][self.key_ego_camera]
+        curr_keyego2global = rt2mat(
+            curr_key_cam['ego2global_translation'],
+            curr_key_cam['ego2global_rotation'])
         
         for idx in self.future_frames:
             adj_idx = index + idx
@@ -147,14 +190,17 @@ class NuScenesDatasetOccVisionPAD(NuScenesDatasetOccpancy):
             if adj_info['scene_token'] != curr_info['scene_token']:
                 adj_info = curr_info
 
-            # obtain the current ego to future ego transformation
-            adj_global2ego = rt2mat(adj_info['ego2global_translation'],
-                                    adj_info['ego2global_rotation'],
-                                    inverse=True)
-            # (4, 4) matrix
-            curr_ego_to_adj_ego = adj_global2ego @ curr_ego_to_global
+            adj_key_cam = adj_info['cams'][self.key_ego_camera]
+            global2adj_keyego = rt2mat(
+                adj_key_cam['ego2global_translation'],
+                adj_key_cam['ego2global_rotation'],
+                inverse=True)
+            # Maps points from the current FL key ego into the adjacent FL
+            # key ego: T_adj_keyego_from_curr_keyego.
+            adj_keyego_from_curr_keyego = (
+                global2adj_keyego @ curr_keyego2global)
 
-            future_pose_spatial = np.stack(adj_info['lidar2cam'])  # (6, 4, 4)
+            adj_keyego2cam = np.stack(adj_info['lidar2cam'])  # (6, 4, 4)
             future_cam_intrinsic = np.stack(adj_info['cam_intrinsic'])  # (6, 4, 4)
 
             if idx == -1:
@@ -162,12 +208,14 @@ class NuScenesDatasetOccVisionPAD(NuScenesDatasetOccpancy):
             else:
                 flag = 'future'
             
-            input_dict[f'pose_spatial_{flag}'] = torch.from_numpy(future_pose_spatial).to(torch.float32)  # (6, 4, 4)
+            input_dict[f'keyego2cam_{flag}'] = torch.from_numpy(
+                adj_keyego2cam).to(torch.float32)
             input_dict[f'cam_intrinsic_{flag}'] = torch.from_numpy(future_cam_intrinsic).to(torch.float32)
-            input_dict[f'curr_lidar_T_{flag}_lidar'] = torch.from_numpy(curr_ego_to_adj_ego)[None].to(torch.float32)
+            input_dict[f'{flag}_keyego_from_curr_keyego'] = torch.from_numpy(
+                adj_keyego_from_curr_keyego)[None].to(torch.float32)
             input_dict[f'{flag}_info'] = adj_info
 
-            if self.use_flow_photometric_loss:
+            if self.load_future_adjacent:
                 # load the adjacent information for the flow-based self-supervised learning
                 future_adj_dict = load_adjacent_info(adj_info, self.extra_frames)
                 ## add the "_future" suffix to the key
@@ -543,4 +591,3 @@ class NuScenesDatasetOccPretrainV2(NuScenesDatasetOccpancy):
         all_cams_sample_pts_inst2 = np.stack(all_cams_sample_pts_list2, axis=0)
         
         return all_cams_sample_pts_inst1, all_cams_sample_pts_inst2
-

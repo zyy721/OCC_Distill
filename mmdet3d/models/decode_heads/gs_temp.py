@@ -721,8 +721,7 @@ class GaussianSplattingDecoder(nn.Module):
 
         # Create world-space covariance matrices.
         covariances = build_covariance(scales, rotations)
-        c2w_rotations = extrinsics[..., :3, :3]
-        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+        covariances = repeat(covariances, "() i j -> b v i j", b=b, v=v)
         gaussians.covariances = covariances ######## Gaussian covariances ########
 
         harmonics = harmonics.unsqueeze(-1).unsqueeze(0)

@@ -262,7 +262,7 @@ def upsample(x):
     return F.interpolate(x, scale_factor=2, mode="nearest")
 
 
-def get_smooth_loss(disp, img):
+def get_smooth_loss(disp, img, valid_mask=None):
     """Computes the smoothness loss for a disparity image
     The color image is used for edge-aware smoothness
     """
@@ -275,7 +275,17 @@ def get_smooth_loss(disp, img):
     grad_disp_x *= torch.exp(-grad_img_x)
     grad_disp_y *= torch.exp(-grad_img_y)
 
-    return grad_disp_x.mean() + grad_disp_y.mean()
+    if valid_mask is None:
+        return grad_disp_x.mean() + grad_disp_y.mean()
+
+    valid_mask = valid_mask.bool()
+    valid_x = valid_mask[:, :, :, :-1] & valid_mask[:, :, :, 1:]
+    valid_y = valid_mask[:, :, :-1, :] & valid_mask[:, :, 1:, :]
+    valid_x = valid_x.to(grad_disp_x.dtype)
+    valid_y = valid_y.to(grad_disp_y.dtype)
+    smooth_x = (grad_disp_x * valid_x).sum() / valid_x.sum().clamp_min(1.0)
+    smooth_y = (grad_disp_y * valid_y).sum() / valid_y.sum().clamp_min(1.0)
+    return smooth_x + smooth_y
 
 
 class SSIM(nn.Module):

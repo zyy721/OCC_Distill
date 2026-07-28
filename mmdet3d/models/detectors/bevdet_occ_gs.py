@@ -16,6 +16,8 @@ from mmdet.models.builder import build_loss
 from mmcv.cnn.bricks.conv_module import ConvModule
 from torch import nn
 from .. import builder
+from ..decode_heads.common.conversions import resize_depth_with_alpha
+from ..decode_heads.common.gaussians import initialize_density_head
 from .bevdet_occ import BEVStereo4DOCC
 from .bevdet import BEVStereo4D
 from .depth_ssl import *
@@ -66,76 +68,153 @@ OCC3D_PALETTE = torch.Tensor([
 ])
 
 
-def warp_voxel_features(voxel_feats, 
+def warp_voxel_features(voxel_feats,
                         voxel_flow,
-                        voxel_size, 
+                        voxel_size,
                         occ_size,
-                        curr_ego_to_future_ego=None):
-    """Warping the voxel features using the predicted voxel flow.
+                        future_keyego_from_curr_keyego=None,
+                        point_cloud_range=None):
+    """Backward-warp current voxel features into a future key-ego frame.
+
+    ``voxel_flow`` is a learned backward sampling residual in metres. It is
+    indexed on the future output lattice, expressed along the current key-ego
+    x/y axes, and added after rigid future-to-current ego compensation:
+
+        p_current = T_current_from_future @ p_future + backward_flow
+
+    PyTorch 5-D ``grid_sample`` consumes a source grid in [z, y, x] order for
+    an input laid out as [B, C, X, Y, Z].
 
     Args:
-        voxel_feats (Tensor): [bs, c, h, w, d]
-        voxel_flow (_type_): torch.Size([bs, f, h, w, d, 2])
-        voxel_size (_type_): voxel resolution in meters
-        occ_size (_type_): voxel size in grid numbers
-        curr_ego_to_future_ego (_type_, optional): _description_. Defaults to None.
+        voxel_feats (Tensor | list[Tensor]): Current [B, C, X, Y, Z] feature.
+        voxel_flow (Tensor): Backward xy residual [B, F, X, Y, Z, 2].
+        voxel_size (Sequence[float]): Metric xyz voxel size.
+        occ_size (Sequence[int]): Number of xyz voxels.
+        future_keyego_from_curr_keyego (Tensor): [B, F, 4, 4] transform.
+        point_cloud_range (Sequence[float]): xyz min followed by xyz max.
 
     Returns:
-        _type_: _description_
+        list[Tensor]: Future-frame features, preserving the historical API.
     """
+    if point_cloud_range is None:
+        raise ValueError('point_cloud_range is required for metric ego warping')
+
     device = voxel_flow.device
-    bs, num_pred, x_size, y_size, z_size, c = voxel_flow.shape
+    dtype = voxel_flow.dtype
+    bs, num_pred, x_size, y_size, z_size, flow_dim = voxel_flow.shape
+    if flow_dim != 2:
+        raise ValueError(f'Expected 2-D xy flow, got {flow_dim} channels')
 
-    if curr_ego_to_future_ego is not None:
-        for i in range(bs):
-            _extrinsic_matrix = curr_ego_to_future_ego[i]
-            _voxel_flow = voxel_flow[i].reshape(num_pred, -1, 2)
-            _voxel_flow = torch.cat([_voxel_flow, torch.zeros(num_pred, _voxel_flow.shape[1], 1).to(device)], dim=-1)
-            trans_flow = torch.matmul(_extrinsic_matrix[:, :3, :3], _voxel_flow.permute(0, 2, 1))
-            trans_flow = trans_flow + _extrinsic_matrix[..., :3, 3][:, :, None]
-            trans_flow = trans_flow.permute(0, 2, 1)[..., :2]
-            voxel_flow[i] = trans_flow.reshape(num_pred, *voxel_flow.shape[2:])
-    
-    ## padding the zero flow for z axis
-    voxel_flow = torch.cat([voxel_flow, torch.zeros(bs, num_pred, x_size, y_size, z_size, 1).to(device)], dim=-1)
+    spatial_shape = torch.tensor(
+        [x_size, y_size, z_size], device=device, dtype=dtype)
+    configured_shape = torch.as_tensor(
+        occ_size, device=device, dtype=dtype).flatten()
+    if configured_shape.numel() != 3 or not torch.equal(
+            configured_shape.to(torch.long), spatial_shape.to(torch.long)):
+        raise ValueError(
+            f'occ_size {configured_shape.tolist()} does not match flow shape '
+            f'{spatial_shape.tolist()}')
 
-    voxel_flow = rearrange(voxel_flow, 'b f h w d dim3 -> (b f) h w d dim3')
-    
-    # normalize the flow in m/s unit to voxel unit and then to [-1, 1]
-    voxel_size = voxel_size.to(device)
-    occ_size = occ_size.to(device)
+    pc_range = torch.as_tensor(
+        point_cloud_range, device=device, dtype=dtype).flatten()
+    if pc_range.numel() != 6:
+        raise ValueError('point_cloud_range must contain six values')
+    xyz_min, xyz_max = pc_range[:3], pc_range[3:]
+    metric_size = xyz_max - xyz_min
+    configured_voxel_size = torch.as_tensor(
+        voxel_size, device=device, dtype=dtype).flatten()
+    actual_voxel_size = metric_size / spatial_shape
+    if configured_voxel_size.numel() != 3 or not torch.allclose(
+            configured_voxel_size,
+            actual_voxel_size,
+            rtol=1e-5,
+            atol=1e-6):
+        raise ValueError(
+            f'voxel_size {configured_voxel_size.tolist()} is inconsistent '
+            f'with range/shape {actual_voxel_size.tolist()}')
 
-    voxel_flow = voxel_flow / voxel_size / occ_size
+    # Physical future voxel centres, in xyz order.
+    xs = xyz_min[0] + (
+        torch.arange(x_size, device=device, dtype=dtype) + 0.5
+    ) * actual_voxel_size[0]
+    ys = xyz_min[1] + (
+        torch.arange(y_size, device=device, dtype=dtype) + 0.5
+    ) * actual_voxel_size[1]
+    zs = xyz_min[2] + (
+        torch.arange(z_size, device=device, dtype=dtype) + 0.5
+    ) * actual_voxel_size[2]
+    future_xyz = torch.stack([
+        xs[:, None, None].expand(x_size, y_size, z_size),
+        ys[None, :, None].expand(x_size, y_size, z_size),
+        zs[None, None, :].expand(x_size, y_size, z_size),
+    ], dim=-1)
+    future_xyz = future_xyz[None, None].expand(
+        bs, num_pred, -1, -1, -1, -1)
 
-    # generate normalized grid
-    x = torch.linspace(-1.0, 1.0, x_size).view(-1, 1, 1).repeat(1, y_size, z_size).to(device)
-    y = torch.linspace(-1.0, 1.0, y_size).view(1, -1, 1).repeat(x_size, 1, z_size).to(device)
-    z = torch.linspace(-1.0, 1.0, z_size).view(1, 1, -1).repeat(x_size, y_size, 1).to(device)
-    grid = torch.cat([x.unsqueeze(-1), y.unsqueeze(-1), z.unsqueeze(-1)], dim=-1)
-    
-    # add flow to grid
-    grid = grid.unsqueeze(0).expand(bs, -1, -1, -1, -1).flip(-1) + voxel_flow
+    if future_keyego_from_curr_keyego is None:
+        future_keyego_from_curr_keyego = torch.eye(
+            4, device=device, dtype=dtype)[None, None].expand(
+                bs, num_pred, -1, -1)
+    else:
+        future_keyego_from_curr_keyego = (
+            future_keyego_from_curr_keyego.to(device=device, dtype=dtype))
+        if future_keyego_from_curr_keyego.ndim == 3:
+            future_keyego_from_curr_keyego = \
+                future_keyego_from_curr_keyego[:, None]
+        if future_keyego_from_curr_keyego.shape[1] == 1 and num_pred > 1:
+            future_keyego_from_curr_keyego = \
+                future_keyego_from_curr_keyego.expand(-1, num_pred, -1, -1)
+        expected_shape = (bs, num_pred, 4, 4)
+        if tuple(future_keyego_from_curr_keyego.shape) != expected_shape:
+            raise ValueError(
+                'future_keyego_from_curr_keyego has shape '
+                f'{tuple(future_keyego_from_curr_keyego.shape)}, expected '
+                f'{expected_shape}')
+
+    curr_keyego_from_future_keyego = torch.linalg.inv(
+        future_keyego_from_curr_keyego)
+    rotation = curr_keyego_from_future_keyego[..., :3, :3]
+    translation = curr_keyego_from_future_keyego[..., :3, 3]
+    source_xyz = torch.einsum(
+        'bfij,bfxyzj->bfxyzi', rotation, future_xyz)
+    source_xyz = source_xyz + translation[:, :, None, None, None, :]
+
+    flow_xyz = torch.cat(
+        [voxel_flow, torch.zeros_like(voxel_flow[..., :1])], dim=-1)
+    source_xyz = source_xyz + flow_xyz
+
+    # Metric xyz -> normalized xyz. Reorder to [z, y, x] because the input
+    # tensor dimensions are [X, Y, Z] while grid_sample expects [D, H, W].
+    source_norm_xyz = 2.0 * (source_xyz - xyz_min) / metric_size - 1.0
+    grid = source_norm_xyz[..., [2, 1, 0]]
+    grid = rearrange(grid, 'b f x y z dim3 -> (b f) x y z dim3')
 
     if not isinstance(voxel_feats, list):
         voxel_feats = [voxel_feats]
 
     outputs = []
-    for _feat in voxel_feats:
-        if _feat is None:
+    for feature in voxel_feats:
+        if feature is None:
             outputs.append(None)
             continue
+        if tuple(feature.shape[2:]) != (x_size, y_size, z_size):
+            raise ValueError(
+                f'Feature shape {tuple(feature.shape[2:])} does not match '
+                f'flow shape {(x_size, y_size, z_size)}')
 
-        # perform the voxel feature warping
-        _feat = _feat.unsqueeze(1).expand(-1, num_pred, -1, -1, -1, -1)
-        _feat = rearrange(_feat, 'b f c h w d -> (b f) c h w d')
-        warped_voxel_feats = F.grid_sample(_feat, 
-                                           grid.float(), 
-                                           mode='nearest', 
-                                           padding_mode='border', 
-                                           align_corners=False)
-        warped_voxel_feats = rearrange(warped_voxel_feats, '(b f) c h w d -> b f c h w d', b=bs)
-        warped_voxel_feats = warped_voxel_feats.squeeze(1)
-        outputs.append(warped_voxel_feats)
+        feature = feature.unsqueeze(1).expand(
+            -1, num_pred, -1, -1, -1, -1)
+        feature = rearrange(feature, 'b f c x y z -> (b f) c x y z')
+        warped = F.grid_sample(
+            feature,
+            grid.to(feature.dtype),
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False)
+        warped = rearrange(
+            warped, '(b f) c x y z -> b f c x y z', b=bs)
+        warped = warped.squeeze(1)
+        outputs.append(warped)
 
     return outputs
 
@@ -157,6 +236,7 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
                  use_depth_consistency=False,
                  render_view_indices=list(range(6)),
                  depth_ssl_size=None,
+                 depth_alpha_threshold=1e-3,
                  depth_loss_weight=1.0,
                  rgb_loss_weight=1.0,
                  use_depth_gt_loss=False,
@@ -166,6 +246,7 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
                  pred_flow=False,
                  voxel_shape=None,
                  voxel_size=None,
+                 point_cloud_range=None,
                  use_flow_ssl=False,
                  use_flow_photometric_loss=False,
                  flow_depth_loss_weight=0.15,
@@ -175,6 +256,8 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
                  use_sperate_render_head=False,
                  use_pseudo_depth_loss=False,
                  pseudo_depth_loss_weight=1.0,
+                 density_init_prob=None,
+                 density_init_std=1e-3,
                  **kwargs):
         super(BEVStereo4DOCCVisionPAD, self).__init__(**kwargs)
         
@@ -194,6 +277,10 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
 
         self.voxel_shape = voxel_shape
         self.voxel_size = voxel_size
+        self.point_cloud_range = point_cloud_range
+        if self.use_flow_ssl and self.point_cloud_range is None:
+            raise ValueError(
+                'point_cloud_range is required when use_flow_ssl=True')
 
         out_dim = self.out_dim
 
@@ -201,6 +288,9 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
         self.use_depth_consistency = use_depth_consistency
         self.render_view_indices = render_view_indices
         self.depth_ssl_size = depth_ssl_size
+        if not 0 < depth_alpha_threshold <= 1:
+            raise ValueError('depth_alpha_threshold must be in (0, 1]')
+        self.depth_alpha_threshold = depth_alpha_threshold
         self.opt = opt  # options for the depth consistency loss
         self.depth_loss_weight = depth_loss_weight
 
@@ -213,6 +303,13 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
 
         self.use_pseudo_depth_loss = use_pseudo_depth_loss
         self.pseudo_depth_loss_weight = pseudo_depth_loss_weight
+
+        if density_init_prob is not None and not 0 < density_init_prob < 1:
+            raise ValueError('density_init_prob must be in (0, 1) or None')
+        if density_init_std < 0:
+            raise ValueError('density_init_std must be non-negative')
+        self.density_init_prob = density_init_prob
+        self.density_init_std = density_init_std
 
         if self.use_depth_consistency:
             h = depth_ssl_size[0]
@@ -256,6 +353,10 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
                 nn.Softplus(),
                 nn.Linear(out_dim * 2, 2),
             )
+            # Start from rigid ego-motion compensation (zero learned residual)
+            # instead of a random sampling field that can leave the volume.
+            nn.init.zeros_(self.flow_head[-1].weight)
+            nn.init.zeros_(self.flow_head[-1].bias)
         
         if self.use_flow_refine_layer:
             self.flow_refine_layer = nn.Sequential(
@@ -284,6 +385,23 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
         del self.final_conv
         if self.use_predicter:
             del self.predicter
+
+    def init_weights(self):
+        super().init_weights()
+        if self.density_init_prob is None:
+            return
+
+        initialize_density_head(
+            self.occupancy_head,
+            self.density_init_prob,
+            self.density_init_std,
+        )
+        if hasattr(self, 'occupancy_head_future'):
+            initialize_density_head(
+                self.occupancy_head_future,
+                self.density_init_prob,
+                self.density_init_std,
+            )
 
     @staticmethod
     def inverse_flip_aug(feat, flip_dx, flip_dy):
@@ -322,7 +440,7 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
         output = dict()
         # output['pose_spatial'] = torch.inverse(kwargs['lidar2cam'])
         output['pose_spatial'] = torch.inverse(kwargs['lidar2cam'].float())
-        output['intrinsics'] = kwargs['cam_intrinsic'].float()  # (bs, 6, 4, 4)
+        output['intrinsics'] = kwargs['cam_intrinsic'].float().clone()  # (bs, 6, 4, 4)
 
         ## 2. Prepare the features for rendering
         _uni_feats = rearrange(uni_feats, 'b c z y x -> b c x y z')
@@ -346,7 +464,11 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
             semantic_output = rearrange(semantic_output, 'b x y z C -> b C x y z')
             output['semantic'] = semantic_output
 
-        if self.pred_flow:
+        if self.pred_flow and not self.use_flow_ssl:
+            # This compatibility branch is only meaningful for consumers that
+            # explicitly use a current-grid flow prediction.  Future SSL
+            # predicts its backward residual after rigid future-grid alignment
+            # below, where the field is actually sampled.
             flow_output = self.flow_head(_uni_feats)
             flow_output = rearrange(flow_output, 'b x y z dim1 -> b () x y z dim1')
             output['flow'] = flow_output
@@ -358,17 +480,44 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
             # the Flow-based SSL
             assert self.pred_flow, "The flow prediction is required for the flow self-supervised loss!"
 
-            # density_prob = output['density_prob']
-            # semantic = output['semantic']
             volume_feature = output['volume_feat']
-            voxel_flow_pred = output['flow']
+            volume_feature_ch_first = rearrange(
+                volume_feature, 'b x y z c -> b c x y z')
+            future_keyego_from_curr_keyego = kwargs[
+                'future_keyego_from_curr_keyego']
+
+            # ``warp_voxel_features`` samples a backward residual indexed on
+            # the future output lattice.  Predict that field from a rigidly
+            # aligned future-grid feature instead of reading a current-grid
+            # pointwise prediction at the same numerical index.
+            batch_size, _, x_size, y_size, z_size = \
+                volume_feature_ch_first.shape
+            rigid_flow = volume_feature_ch_first.new_zeros(
+                (batch_size, 1, x_size, y_size, z_size, 2))
+            rigid_future_feature = warp_voxel_features(
+                volume_feature_ch_first,
+                rigid_flow,
+                voxel_size=self.voxel_size,
+                occ_size=self.voxel_shape,
+                future_keyego_from_curr_keyego=(
+                    future_keyego_from_curr_keyego),
+                point_cloud_range=self.point_cloud_range)[0]
+            rigid_future_feature = rearrange(
+                rigid_future_feature, 'b c x y z -> b x y z c')
+
+            voxel_flow_pred = self.flow_head(rigid_future_feature)
+            voxel_flow_pred = rearrange(
+                voxel_flow_pred, 'b x y z dim2 -> b () x y z dim2')
+            output['flow'] = voxel_flow_pred
 
             warped_results = warp_voxel_features(
-                rearrange(volume_feature, 'b x y z c -> b c x y z'), 
+                volume_feature_ch_first,
                 voxel_flow_pred, 
-                voxel_size=torch.Tensor(self.voxel_size), 
-                occ_size=torch.Tensor(self.voxel_shape),
-                curr_ego_to_future_ego=kwargs.get('curr_lidar_T_future_lidar', None))
+                voxel_size=self.voxel_size,
+                occ_size=self.voxel_shape,
+                future_keyego_from_curr_keyego=(
+                    future_keyego_from_curr_keyego),
+                point_cloud_range=self.point_cloud_range)
             
             future_volume_feat = warped_results[0]  # (bs, c, x, y, z)
             if self.use_flow_refine_layer:
@@ -378,10 +527,14 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
             future_output = dict()
             future_output['volume_feat'] = future_volume_feat
 
-            future_output['pose_spatial'] = kwargs['pose_spatial_future']
-            future_output['intrinsics'] = kwargs['cam_intrinsic_future']
-            future_output['intrinsics'][:, :, 0] *= self.render_scale[1]
-            future_output['intrinsics'][:, :, 1] *= self.render_scale[0]
+            # ``keyego2cam_future`` comes from the pkl ``lidar2cam`` field
+            # and is future-keyego-to-camera (world-to-camera).
+            # Gaussian rendering expects camera-to-world in the future key
+            # ego frame, consistently with the current-frame branch above.
+            future_output['pose_spatial'] = torch.inverse(
+                kwargs['keyego2cam_future'].float())
+            future_output['intrinsics'] = (
+                kwargs['cam_intrinsic_future'].float().clone())
 
             # start rendering future volume feature
             if self.use_sperate_render_head:
@@ -407,9 +560,11 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
 
         ## 3. Compute the loss
         target_dict = dict(**kwargs)
+        # Detection pretraining intentionally excludes the sparse LiDAR depth
+        # loss computed above; only the rendering/self-supervised objectives
+        # participate in backpropagation.
         losses = self.loss(render_results, target_dict)
         return losses
-    
     def loss(self, preds_dict, targets):
         if self.use_depth_consistency:
             ## Visualize the input data
@@ -535,9 +690,17 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
         # rescale the rendered depth
         depth = outputs['render_depth' + suffix][:, self.render_view_indices]
         depth = rearrange(depth, 'b num_view h w -> (b num_view) () h w')
-        depth = F.interpolate(
-            depth, self.depth_ssl_size, mode="bilinear", align_corners=False)
+        alpha = outputs['render_alpha' + suffix][:, self.render_view_indices]
+        alpha = rearrange(alpha, 'b num_view h w -> (b num_view) () h w')
+        depth, alpha, depth_valid = resize_depth_with_alpha(
+            depth,
+            alpha,
+            self.depth_ssl_size,
+            alpha_threshold=self.depth_alpha_threshold,
+        )
         outputs['render_depth_rescaled' + suffix] = depth
+        outputs['render_alpha_rescaled' + suffix] = alpha
+        outputs['render_depth_valid' + suffix] = depth_valid
 
         cam_T_cam = inputs["cam_T_cam" + suffix][:, :, self.render_view_indices]
 
@@ -572,7 +735,12 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
         loss = 0
 
         depth = outputs["render_depth_rescaled" + suffix]  # (M, 1, h, w)
-        disp = 1.0 / (depth + 1e-7)
+        depth_valid = outputs["render_depth_valid" + suffix]
+        disp = torch.where(
+            depth_valid,
+            1.0 / depth.clamp_min(1e-7),
+            torch.zeros_like(depth),
+        )
         color = outputs["target_imgs" + suffix]
         target = outputs["target_imgs" + suffix]
 
@@ -605,8 +773,8 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
 
         if not self.opt.disable_automasking:
             # add random numbers to break ties
-            identity_reprojection_loss += torch.randn(
-                identity_reprojection_loss.shape).cuda() * 0.00001
+            identity_reprojection_loss += torch.randn_like(
+                identity_reprojection_loss) * 0.00001
 
             combined = torch.cat((identity_reprojection_loss, reprojection_loss), dim=1)
         else:
@@ -617,11 +785,14 @@ class BEVStereo4DOCCVisionPAD(BEVStereo4DOCC):
         else:
             to_optimise, idxs = torch.min(combined, dim=1)
 
-        loss += to_optimise.mean()
+        valid_weight = depth_valid[:, 0].to(to_optimise.dtype)
+        loss += (to_optimise * valid_weight).sum() / valid_weight.sum().clamp_min(1.0)
 
-        mean_disp = disp.mean(2, True).mean(3, True)
+        valid_float = depth_valid.to(disp.dtype)
+        mean_disp = disp.sum((2, 3), keepdim=True) / valid_float.sum(
+            (2, 3), keepdim=True).clamp_min(1.0)
         norm_disp = disp / (mean_disp + 1e-7)
-        smooth_loss = get_smooth_loss(norm_disp, color)
+        smooth_loss = get_smooth_loss(norm_disp, color, depth_valid)
 
         loss += self.opt.disparity_smoothness * smooth_loss
         
@@ -955,4 +1126,3 @@ class BEVStereo4DOCCGS(BEVStereo4D):
             losses.update(gs_losses)
 
         return losses
-    

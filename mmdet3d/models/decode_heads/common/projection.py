@@ -232,3 +232,74 @@ def get_fov(intrinsics: Float[Tensor, "batch 3 3"]):
     fov_x = (left * right).sum(dim=-1).acos()
     fov_y = (top * bottom).sum(dim=-1).acos()
     return torch.stack((fov_x, fov_y), dim=-1)
+
+
+def get_projection_matrix_from_intrinsics(
+    intrinsics: Float[Tensor, "*batch 3 3"],
+    near: Float[Tensor, "*batch"],
+    far: Float[Tensor, "*batch"],
+) -> Float[Tensor, "*batch 4 4"]:
+    """Build a perspective projection without discarding the principal point.
+
+    The first and second rows of ``intrinsics`` must already be normalized by
+    image width and height respectively. Camera coordinates follow the
+    rasterizer convention: x points right, y points down, and z points forward.
+    The returned matrix maps x/y to [-1, 1] and z to [0, 1].
+
+    Unlike a projection reconstructed from a single horizontal/vertical FOV,
+    this matrix preserves an off-centre principal point. A centred intrinsic
+    matrix (cx=cy=0.5) exactly reduces to the legacy symmetric projection.
+    """
+    if intrinsics.shape[-2:] != (3, 3):
+        raise ValueError(
+            f'Expected intrinsics with shape (..., 3, 3), got '
+            f'{tuple(intrinsics.shape)}')
+    if tuple(near.shape) != tuple(intrinsics.shape[:-2]):
+        raise ValueError(
+            f'near shape {tuple(near.shape)} does not match intrinsics batch '
+            f'shape {tuple(intrinsics.shape[:-2])}')
+    if tuple(far.shape) != tuple(intrinsics.shape[:-2]):
+        raise ValueError(
+            f'far shape {tuple(far.shape)} does not match intrinsics batch '
+            f'shape {tuple(intrinsics.shape[:-2])}')
+
+    near = near.to(device=intrinsics.device, dtype=intrinsics.dtype)
+    far = far.to(device=intrinsics.device, dtype=intrinsics.dtype)
+    result = torch.zeros(
+        (*intrinsics.shape[:-2], 4, 4),
+        dtype=intrinsics.dtype,
+        device=intrinsics.device)
+
+    # With clip_w=z, these rows yield
+    # ndc_x = 2 * (fx*x/z + skew*y/z + cx) - 1, and likewise for y.
+    result[..., 0, 0] = 2.0 * intrinsics[..., 0, 0]
+    result[..., 0, 1] = 2.0 * intrinsics[..., 0, 1]
+    result[..., 0, 2] = 2.0 * intrinsics[..., 0, 2] - 1.0
+    result[..., 1, 0] = 2.0 * intrinsics[..., 1, 0]
+    result[..., 1, 1] = 2.0 * intrinsics[..., 1, 1]
+    result[..., 1, 2] = 2.0 * intrinsics[..., 1, 2] - 1.0
+
+    result[..., 3, 2] = 1.0
+    result[..., 2, 2] = far / (far - near)
+    result[..., 2, 3] = -(far * near) / (far - near)
+    return result
+
+
+def get_tanfov_from_intrinsics(
+    intrinsics: Float[Tensor, "*batch 3 3"],
+) -> Float[Tensor, "*batch 2"]:
+    """Return rasterizer tan(FOV/2) values that recover the true fx/fy.
+
+    ``diff_gauss`` derives pixel focal length as
+    ``width / (2*tanfovx)`` (and equivalently for y). For intrinsics normalized
+    by image width/height, using 0.5/fx and 0.5/fy therefore preserves the
+    calibrated focal lengths independently of the principal point.
+    """
+    if intrinsics.shape[-2:] != (3, 3):
+        raise ValueError(
+            f'Expected intrinsics with shape (..., 3, 3), got '
+            f'{tuple(intrinsics.shape)}')
+    return torch.stack((
+        0.5 / intrinsics[..., 0, 0],
+        0.5 / intrinsics[..., 1, 1],
+    ), dim=-1)

@@ -10,8 +10,15 @@ from diff_gauss import (
 from einops import einsum, rearrange, repeat
 from torch import Tensor
 
-from .projection import get_fov, homogenize_points
-from .conversions import depth_to_relative_disparity
+from .projection import (
+    get_projection_matrix_from_intrinsics,
+    get_tanfov_from_intrinsics,
+    homogenize_points,
+)
+from .conversions import (
+    accumulated_depth_to_expected_depth,
+    depth_to_relative_disparity,
+)
 
 
 def get_projection_matrix(
@@ -58,11 +65,14 @@ def render_cuda(
     scale_invariant: bool = True,
     use_sh: bool = True,
     feats3D: Tensor = None,
+    return_alpha: bool = False,
 ): # -> Float[Tensor, "batch 3 height width"]:
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
 
     # Make sure everything is in a range where numerical issues don't appear.
+    depth_unit_scale = torch.ones_like(near)
     if scale_invariant:
+        depth_unit_scale = near.clone()
         scale = 1 / near
         extrinsics = extrinsics.clone()
         extrinsics[..., :3, 3] = extrinsics[..., :3, 3] * scale[:, None]
@@ -78,17 +88,21 @@ def render_cuda(
     b, _, _ = extrinsics.shape
     h, w = image_shape
 
-    fov_x, fov_y = get_fov(intrinsics).unbind(dim=-1)
-    tan_fov_x = (0.5 * fov_x).tan()
-    tan_fov_y = (0.5 * fov_y).tan()
-
-    projection_matrix = get_projection_matrix(near, far, fov_x, fov_y)
+    # ``intrinsics`` is normalized to image width/height by every active GS
+    # head. Preserve cx/cy in an asymmetric projection instead of collapsing K
+    # to a symmetric total FOV. The rasterizer also reconstructs focal length
+    # from tanfov, so derive it directly from fx/fy rather than from edge rays.
+    tan_fov_x, tan_fov_y = get_tanfov_from_intrinsics(
+        intrinsics).unbind(dim=-1)
+    projection_matrix = get_projection_matrix_from_intrinsics(
+        intrinsics, near, far)
     projection_matrix = rearrange(projection_matrix, "b i j -> b j i")
     view_matrix = rearrange(extrinsics.inverse(), "b i j -> b j i")
     full_projection = view_matrix @ projection_matrix
 
     all_images = []
     all_depth = []
+    all_alpha = []
     all_feats = []
     for i in range(b):
         # Set up a tensor for the gradients of the screen-space means.
@@ -134,12 +148,20 @@ def render_cuda(
         image, depth, norm, alpha, radii, feats = results  # the new one
         all_feats.append(feats)
         all_images.append(image)
-        all_depth.append(depth)
+        all_depth.append(accumulated_depth_to_expected_depth(
+            depth,
+            alpha,
+            depth_unit_scale[i],
+        ))
+        all_alpha.append(alpha)
     
     image_batch = torch.stack(all_images)
     depth_batch = torch.stack(all_depth)
     feats_batch = torch.stack(all_feats)
+    alpha_batch = torch.stack(all_alpha)
 
+    if return_alpha:
+        return image_batch, depth_batch, feats_batch, alpha_batch
     return image_batch, depth_batch, feats_batch
     
     # if feats3D is None:

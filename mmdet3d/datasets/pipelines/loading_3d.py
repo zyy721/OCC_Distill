@@ -117,10 +117,11 @@ class PrepareImageInputsForVisionPAD(PrepareImageInputsForNeRF):
             # first convert to the BEVDet input size
             post_rot = torch.stack(results['post_rots']) # (2, 2)
             post_trans = torch.stack(results['post_trans']) # (2, 1)
-            post_mat = torch.eye(4).repeat(6, 1, 1)
+            K = torch.as_tensor(results['K'], dtype=torch.float32)
+            post_mat = torch.eye(4).repeat(K.shape[0], 1, 1)
             post_mat[:, :2, :2] = post_rot[:, :2, :2]
             post_mat[:, :2, 2] = post_trans[:, :2]
-            temp_K = post_mat @ results['K']
+            temp_K = post_mat @ K
 
             ## process the intrinsic matrix
             ori_shape = np.array(img_ori[0]).shape
@@ -129,7 +130,7 @@ class PrepareImageInputsForVisionPAD(PrepareImageInputsForNeRF):
             temp_K[:, 0] *= w / origin_w
             temp_K[:, 1] *= h / origin_h
             output['K'] = temp_K
-            output['inv_K'] = torch.pinverse(results['K'])
+            output['inv_K'] = torch.pinverse(temp_K)
 
         # process multiple imgs in single frame
         imgs = [img.transpose(2, 0, 1) for img in imgs]
@@ -181,35 +182,38 @@ class PrepareImageInputsForVisionPAD(PrepareImageInputsForNeRF):
         # update the camera intrinsic matrix of current frame
         post_mat = self.get_post_matrix()
         results['cam_intrinsic'] = torch.stack(
-            [post_mat @ _intri for _intri in results['cam_intrinsic']])
+            [post_mat @ torch.as_tensor(_intri, dtype=torch.float32)
+             for _intri in results['cam_intrinsic']])
+
+        if 'cam_intrinsic_future' in results:
+            results['cam_intrinsic_future'] = torch.stack(
+                [post_mat @ torch.as_tensor(_intri, dtype=torch.float32)
+                 for _intri in results['cam_intrinsic_future']])
 
         if self.load_future_img:
             # load the future anchor image
             assert 'future_info' in results, \
                 'future_info should be in results'
-            future_results = results['future_info']
+            future_info = results['future_info']
+            filenames = [
+                future_info['cams'][cam_name]['data_path']
+                for cam_name in results['cam_names']
+            ]
+            loaded = [self._load_image(filename) for filename in filenames]
+            imgs, post_rots, post_trans = zip(*loaded)
 
-            filename = future_results["img_filename"]
-            imgs = [self._load_image(name) for name in filename]
-
-            future_results = dict()
-            future_results["img_ori"] = imgs
-            future_results["ori_shape"] = [img.shape for img in imgs]
-            future_results["adjacent"] = results.get('adjacent_future', None)
-            future_results["K"] = results.get('K_future', None)
-
-            # load the future adjacent image
-            self.prepare_data(future_results)
-
-            # update to the results
-            if 'source_imgs' in future_results:
-                results['source_imgs_future'] = future_results['source_imgs']
-            
-            results['target_imgs_future'] = future_results['target_imgs']
-
-            if 'inv_K' in future_results:
-                results['K_future'] = future_results['K']
-                results['inv_K_future'] = future_results['inv_K']
+            future_results = dict(
+                cam_names=results['cam_names'],
+                img_ori=list(imgs),
+                post_rots=list(post_rots),
+                post_trans=list(post_trans),
+                adjacent=results.get('adjacent_future', None),
+                K=results.get('K_future', None),
+            )
+            future_data = self.prepare_data(future_results)
+            for key in ('source_imgs', 'target_imgs', 'K', 'inv_K'):
+                if key in future_data:
+                    results[f'{key}_future'] = future_data[key]
         
         return results
     
@@ -344,4 +348,3 @@ class PrepareImageInputsForVisionPAD(PrepareImageInputsForNeRF):
         results['img_files'] = img_files
         return (imgs, sensor2egos, ego2globals, intrins, post_rots, post_trans), \
                 render_img_gts, post_rots_ori, post_trans_ori
-

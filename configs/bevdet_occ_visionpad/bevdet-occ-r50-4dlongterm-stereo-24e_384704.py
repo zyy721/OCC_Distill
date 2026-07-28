@@ -92,6 +92,11 @@ model = dict(
     # for 3DGS
     render_scale=_render_scale,
     depth_ssl_size=depth_ssl_size,  # the image size for image warping in depth SSL
+    depth_alpha_threshold=1e-3,
+    # Keep the dense 200x200x16 Gaussian volume transparent enough for rays
+    # and gradients to reach voxels behind the first few intersections.
+    density_init_prob=0.01,
+    density_init_std=1e-3,
     pred_flow=False,
     use_flow_ssl=False,
     use_flow_photometric_loss=use_flow_photometric_loss,  # whether to use photometric loss or GT depth loss for flow
@@ -166,7 +171,7 @@ model = dict(
     ## For 3DGS
     render_head_cfg=dict(
         type="GaussianSplattingDecoderVisionPad",
-        filter_opacities=True,
+        filter_opacities=False,
         semantic_head=use_semantic,
         render_size=data_config['render_size'],
         depth_range=[0.1, 64],
@@ -279,6 +284,8 @@ share_data_config = dict(
     filter_empty_gt=False,
     img_info_prototype='bevdet4d',
     multi_adj_frame_id_cfg=multi_adj_frame_id_cfg,
+    key_ego_camera='CAM_FRONT_LEFT',
+    require_keyego_metadata=True,
 )
 
 test_data_config = dict(
@@ -286,7 +293,8 @@ test_data_config = dict(
     # ann_file=data_root + 'bevdetv2-nuscenes_infos_val_visionpad.pkl')
     # ann_file=data_root + 'nuscenes_unified_infos_val_v4.pkl')
     # ann_file=data_root + 'nuscenes_unified_infos_val_v4_ann_infos.pkl')
-    ann_file=data_root + 'nuscenes_unified_infos_val_v4_ann_infos_ego.pkl')
+    ann_file=(data_root
+              + 'nuscenes_unified_infos_val_v4_ann_infos_fl_keyego.pkl'))
 
 data = dict(
     samples_per_gpu=2,
@@ -299,7 +307,8 @@ data = dict(
         # ann_file=data_root + 'bevdetv2-nuscenes_infos_train_visionpad.pkl',
         # ann_file=data_root + 'nuscenes_unified_infos_train_v4.pkl',
         # ann_file=data_root + 'nuscenes_unified_infos_train_v4_ann_infos.pkl',
-        ann_file=data_root + 'nuscenes_unified_infos_train_v4_ann_infos_ego.pkl',
+        ann_file=(data_root
+                  + 'nuscenes_unified_infos_train_v4_ann_infos_fl_keyego.pkl'),
 
         pipeline=train_pipeline,
         classes=class_names,
@@ -333,5 +342,5 @@ runner = dict(type='EpochBasedRunner', max_epochs=12)
 #     ),
 # ]
 
-load_from="ckpts/bevdet-r50-4dlongterm-stereo-cbgs.pth"
+# load_from="ckpts/bevdet-r50-4dlongterm-stereo-cbgs.pth"
 # fp16 = dict(loss_scale='dynamic')

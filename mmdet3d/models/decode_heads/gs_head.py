@@ -18,7 +18,10 @@ from einops import rearrange, repeat
 from mmdet3d.models.builder import HEADS
 
 from mmdet3d.models.decode_heads.nerf_head import NeRFDecoderHead
-from .common.gaussians import build_covariance
+from .common.gaussians import (
+    broadcast_covariances_to_views,
+    build_covariance,
+)
 from .common.cuda_splatting import render_cuda, render_depth_cuda, render_depth_cuda2
 from .common.sh_rotation import rotate_sh
 
@@ -207,8 +210,7 @@ class GaussianSplattingDecoder(NeRFDecoderHead):
 
         # Create world-space covariance matrices.
         covariances = build_covariance(scales, rotations)
-        c2w_rotations = extrinsics[..., :3, :3]
-        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+        covariances = repeat(covariances, "() i j -> b v i j", b=b, v=v)
         gaussians.covariances = covariances ######## Gaussian covariances ########
 
         gaussians.harmonics = harmonics ######## Gaussian harmonics ########
@@ -388,8 +390,7 @@ class GaussianSplattingDecoder(NeRFDecoderHead):
 
         # Create world-space covariance matrices.
         covariances = build_covariance(scales, rotations)
-        c2w_rotations = extrinsics[..., :3, :3]
-        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+        covariances = repeat(covariances, "() i j -> b v i j", b=b, v=v)
         gaussians.covariances = covariances ######## Gaussian covariances ########
 
         gaussians.harmonics = harmonics ######## Gaussian harmonics ########
@@ -459,15 +460,11 @@ class GaussianSplattingDecoder(NeRFDecoderHead):
 
             # Create world-space covariance matrices.
             covariances = build_covariance(scales, rotations)
-            covariances = rearrange(covariances, "b g i j -> b () g i j")
-
-            c2w_rotations = extrinsics[..., :3, :3]
-            c2w_rotations = rearrange(c2w_rotations, "b v i j -> b v () i j")
-            covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+            covariances = broadcast_covariances_to_views(covariances, v)
             gaussians.covariances = covariances  # (bs, v, g, i, j)
 
             ## TODO: rotate_sh cause assert due to extrinsics coordinate denifition
-            # harmonics = rotate_sh(sh, c2w_rotations[..., None, :, :])
+            # harmonics = rotate_sh(sh, extrinsics[..., None, :3, :3])
             gaussians.harmonics = sh
         
             return gaussians
@@ -540,8 +537,7 @@ class GaussianSplattingDecoder(NeRFDecoderHead):
 
         # Create world-space covariance matrices.
         covariances = build_covariance(scales, rotations)
-        c2w_rotations = extrinsics[..., :3, :3]
-        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+        covariances = repeat(covariances, "() i j -> b v i j", b=b, v=v)
         gaussians.covariances = covariances ######## Gaussian covariances ########
 
         harmonics = harmonics.unsqueeze(-1).unsqueeze(0)
